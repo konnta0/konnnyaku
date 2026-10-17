@@ -1,0 +1,344 @@
+mod asr;
+mod audio;
+mod metrics;
+mod translation;
+
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use crossbeam_channel::{RecvTimeoutError, bounded};
+use tracing_subscriber::EnvFilter;
+
+use crate::asr::{AsrEngine, AsrEvent, AsrModelPaths};
+use crate::audio::{chunk_samples, load_wav_mono_f32, samples_for_ms, start_default_input};
+use crate::metrics::TranslationMetrics;
+use crate::translation::{OnnxMarianTranslator, Translator};
+
+const DEFAULT_ASR_DIR: &str = "models/asr/zipformer-en";
+const DEFAULT_MT_DIR: &str = "models/translation/marian-en-ja/onnx";
+const AUDIO_QUEUE_CAPACITY: usize = 50;
+const TRANSLATION_QUEUE_CAPACITY: usize = 8;
+const CHUNK_MS: u32 = 200;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "konnnyaku",
+    about = "Fully local English speech to Japanese subtitles"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Streaming English ASR from a WAV file or microphone.
+    Asr(AsrArgs),
+    /// Translate English text with the local Marian ONNX model.
+    Translate(TranslateArgs),
+    /// Microphone ASR with Japanese subtitles for finalized utterances.
+    Live(LiveArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct AsrArgs {
+    /// 16-bit or 32-bit WAV path. Mutually exclusive with --mic.
+    #[arg(long)]
+    wav: Option<PathBuf>,
+    /// Capture from the default microphone.
+    #[arg(long, default_value_t = false)]
+    mic: bool,
+    /// Directory containing encoder/decoder/joiner/tokens.
+    #[arg(long, default_value = DEFAULT_ASR_DIR)]
+    model_dir: PathBuf,
+    /// Endpoint rule2 trailing silence in seconds.
+    #[arg(long, default_value_t = 0.8)]
+    rule2: f32,
+    /// ONNX Runtime threads inside sherpa-onnx.
+    #[arg(long, default_value_t = 2)]
+    threads: i32,
+}
+
+#[derive(clap::Args, Debug)]
+struct TranslateArgs {
+    /// English sentence to translate.
+    #[arg(long)]
+    text: Option<String>,
+    /// Text file with one English sentence per line.
+    #[arg(long)]
+    file: Option<PathBuf>,
+    /// Directory containing encoder/decoder ONNX and tokenizers.
+    #[arg(long, default_value = DEFAULT_MT_DIR)]
+    model_dir: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct LiveArgs {
+    /// Directory containing encoder/decoder/joiner/tokens.
+    #[arg(long, default_value = DEFAULT_ASR_DIR)]
+    asr_model_dir: PathBuf,
+    /// Directory containing encoder/decoder ONNX and tokenizers.
+    #[arg(long, default_value = DEFAULT_MT_DIR)]
+    mt_model_dir: PathBuf,
+    /// Endpoint rule2 trailing silence in seconds.
+    #[arg(long, default_value_t = 0.8)]
+    rule2: f32,
+    /// ONNX Runtime threads inside sherpa-onnx.
+    #[arg(long, default_value_t = 2)]
+    threads: i32,
+}
+
+struct TranslationJob {
+    english: String,
+    utterance_ended: Instant,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("konnnyaku=info".parse()?))
+        .with_writer(io::stderr)
+        .init();
+
+    match Cli::parse().command {
+        Command::Asr(args) => run_asr(args),
+        Command::Translate(args) => run_translate(args),
+        Command::Live(args) => run_live(args),
+    }
+}
+
+fn run_asr(args: AsrArgs) -> Result<()> {
+    if args.wav.is_some() == args.mic {
+        anyhow::bail!("specify exactly one of --wav or --mic");
+    }
+    let paths = AsrModelPaths::from_dir(&args.model_dir)?;
+    let mut engine = AsrEngine::new(&paths, args.threads, args.rule2)?;
+
+    if let Some(wav) = args.wav {
+        run_asr_wav(&mut engine, wav)?;
+    } else {
+        run_asr_mic(&mut engine)?;
+    }
+    eprintln!("ASR metrics: {}", engine.metrics());
+    Ok(())
+}
+
+fn run_asr_wav(engine: &mut AsrEngine, wav: PathBuf) -> Result<()> {
+    let audio = load_wav_mono_f32(&wav)?;
+    tracing::info!(
+        path = %wav.display(),
+        sample_rate = audio.sample_rate,
+        samples = audio.samples.len(),
+        "loaded wav"
+    );
+    let mut display = TranscriptDisplay::new();
+    for chunk in chunk_samples(&audio.samples, audio.sample_rate, CHUNK_MS) {
+        display.handle(engine.push_samples(audio.sample_rate, &chunk)?);
+    }
+    display.handle(engine.finish_input()?);
+    display.finish();
+    Ok(())
+}
+
+fn run_asr_mic(engine: &mut AsrEngine) -> Result<()> {
+    let running = install_ctrlc()?;
+    let (capture, rx) = start_default_input(AUDIO_QUEUE_CAPACITY)?;
+    let mut display = TranscriptDisplay::new();
+    let mut buffer = Vec::new();
+    let mut sample_rate = 0_u32;
+
+    println!("Streaming microphone ASR. Press Ctrl+C to stop.");
+    while running.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                sample_rate = chunk.sample_rate;
+                buffer.extend_from_slice(&chunk.samples);
+                let chunk_len = samples_for_ms(sample_rate, CHUNK_MS).max(1);
+                while buffer.len() >= chunk_len {
+                    let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
+                    display.handle(engine.push_samples(sample_rate, &samples)?);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if sample_rate > 0 && !buffer.is_empty() {
+        display.handle(engine.push_samples(sample_rate, &buffer)?);
+    }
+    display.handle(engine.finish_input()?);
+    display.finish();
+    engine.metrics_mut().add_drops(capture.drops());
+    drop(capture);
+    Ok(())
+}
+
+fn run_translate(args: TranslateArgs) -> Result<()> {
+    if args.text.is_some() == args.file.is_some() {
+        anyhow::bail!("specify exactly one of --text or --file");
+    }
+    let mut translator = OnnxMarianTranslator::from_dir(&args.model_dir)?;
+    if let Some(text) = args.text {
+        println!("{}", translator.translate(&text)?);
+    } else {
+        let file = args.file.expect("file set");
+        let contents =
+            std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let japanese = translator.translate(line)?;
+            println!("EN: {line}");
+            println!("JA: {japanese}");
+            println!();
+        }
+    }
+    eprintln!("translation metrics: {}", translator.metrics());
+    Ok(())
+}
+
+fn run_live(args: LiveArgs) -> Result<()> {
+    let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
+    let mut engine = AsrEngine::new(&asr_paths, args.threads, args.rule2)?;
+    let mut translator = OnnxMarianTranslator::from_dir(&args.mt_model_dir)?;
+
+    let running = install_ctrlc()?;
+    let (capture, rx) = start_default_input(AUDIO_QUEUE_CAPACITY)?;
+    let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
+    let (done_tx, done_rx) = bounded::<()>(1);
+
+    let mt_thread = std::thread::spawn(move || -> Result<TranslationMetrics> {
+        let mut e2e = TranslationMetrics::new()?;
+        while let Ok(job) = mt_rx.recv() {
+            match translator.translate(&job.english) {
+                Ok(japanese) => {
+                    e2e.record(job.utterance_ended.elapsed());
+                    println!("JA: {japanese}");
+                    let _ = io::stdout().flush();
+                }
+                Err(err) => tracing::error!(%err, "translation failed"),
+            }
+        }
+        let _ = done_tx.send(());
+        Ok(e2e)
+    });
+
+    let mut display = TranscriptDisplay::new();
+    let mut buffer = Vec::new();
+    let mut sample_rate = 0_u32;
+    let mut translation_queue_drops = 0_u64;
+
+    println!("Live EN->JA. Partials are English; finals are translated. Press Ctrl+C to stop.");
+    while running.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                sample_rate = chunk.sample_rate;
+                buffer.extend_from_slice(&chunk.samples);
+                let chunk_len = samples_for_ms(sample_rate, CHUNK_MS).max(1);
+                while buffer.len() >= chunk_len {
+                    let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
+                    let events = engine.push_samples(sample_rate, &samples)?;
+                    translation_queue_drops += enqueue_finals(&mt_tx, &events);
+                    display.handle(events);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if sample_rate > 0 && !buffer.is_empty() {
+        let events = engine.push_samples(sample_rate, &buffer)?;
+        translation_queue_drops += enqueue_finals(&mt_tx, &events);
+        display.handle(events);
+    }
+    let events = engine.finish_input()?;
+    translation_queue_drops += enqueue_finals(&mt_tx, &events);
+    display.handle(events);
+    display.finish();
+
+    drop(mt_tx);
+    let _ = done_rx.recv_timeout(Duration::from_secs(30));
+    engine.metrics_mut().add_drops(capture.drops());
+    drop(capture);
+
+    eprintln!("ASR metrics: {}", engine.metrics());
+    eprintln!("translation queue drops: {translation_queue_drops}");
+    match mt_thread.join() {
+        Ok(Ok(e2e)) => eprintln!("utterance-end to subtitle: {e2e}"),
+        Ok(Err(err)) => tracing::error!(%err, "translation thread failed"),
+        Err(_) => tracing::error!("translation thread panicked"),
+    }
+    Ok(())
+}
+
+fn enqueue_finals(tx: &crossbeam_channel::Sender<TranslationJob>, events: &[AsrEvent]) -> u64 {
+    let mut drops = 0;
+    for event in events {
+        if let AsrEvent::Final(english) = event {
+            match tx.try_send(TranslationJob {
+                english: english.clone(),
+                utterance_ended: Instant::now(),
+            }) {
+                Ok(()) => {}
+                Err(_) => drops += 1,
+            }
+        }
+    }
+    drops
+}
+
+fn install_ctrlc() -> Result<Arc<AtomicBool>> {
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        flag.store(false, Ordering::SeqCst);
+    })
+    .context("install Ctrl+C handler")?;
+    Ok(running)
+}
+
+struct TranscriptDisplay {
+    last_partial: String,
+}
+
+impl TranscriptDisplay {
+    fn new() -> Self {
+        Self {
+            last_partial: String::new(),
+        }
+    }
+
+    fn handle(&mut self, events: Vec<AsrEvent>) {
+        for event in events {
+            match event {
+                AsrEvent::Partial(text) => {
+                    self.last_partial = text;
+                    print!("\rEN: {}", self.last_partial);
+                    let _ = io::stdout().flush();
+                }
+                AsrEvent::Final(text) => {
+                    if !self.last_partial.is_empty() {
+                        print!("\r");
+                    }
+                    println!("EN: {text}");
+                    self.last_partial.clear();
+                    let _ = io::stdout().flush();
+                }
+            }
+        }
+    }
+
+    fn finish(&self) {
+        if !self.last_partial.is_empty() {
+            println!();
+        }
+    }
+}

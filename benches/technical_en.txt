@@ -1,0 +1,20 @@
+We need to update the server.
+The pull request failed continuous integration.
+Please share the memory dump from the crash.
+The API latency exceeded five hundred milliseconds.
+Can you rebase onto the main branch?
+The database migration is not idempotent.
+We should add a timeout to the HTTP client.
+The microphone sample rate is forty eight kilohertz.
+Real time factor must stay below zero point five.
+Only finalized utterances are translated.
+The encoder and decoder are separate ONNX sessions.
+Apple Silicon has unified memory.
+This is a proof of concept without a user interface.
+Streaming speech recognition uses a zipformer transducer.
+Drop audio chunks if the queue is full.
+Endpoint detection waits for trailing silence.
+The model must run fully offline after download.
+Japanese subtitles should appear after the utterance ends.
+We measured p fifty, p ninety five, and p ninety nine.
+Please restart the worker after deploying the patch.
