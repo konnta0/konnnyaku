@@ -15,7 +15,10 @@ use crossbeam_channel::{RecvTimeoutError, bounded};
 use tracing_subscriber::EnvFilter;
 
 use crate::asr::{AsrEngine, AsrEvent, AsrModelPaths};
-use crate::audio::{chunk_samples, load_wav_mono_f32, samples_for_ms, start_default_input};
+use crate::audio::{
+    CaptureSource, chunk_samples, list_tappable_apps, load_wav_mono_f32, samples_for_ms,
+    start_capture,
+};
 use crate::metrics::TranslationMetrics;
 use crate::translation::{OnnxMarianTranslator, Translator};
 
@@ -37,22 +40,30 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Streaming English ASR from a WAV file or microphone.
+    /// Streaming English ASR from a WAV file, microphone, system output, or one app.
     Asr(AsrArgs),
     /// Translate English text with the local Marian ONNX model.
     Translate(TranslateArgs),
-    /// Microphone ASR with Japanese subtitles for finalized utterances.
+    /// Live ASR with Japanese subtitles for finalized utterances.
     Live(LiveArgs),
+    /// List running apps that currently have tappable audio output.
+    Apps,
 }
 
 #[derive(clap::Args, Debug)]
 struct AsrArgs {
-    /// 16-bit or 32-bit WAV path. Mutually exclusive with --mic.
+    /// 16-bit or 32-bit WAV path. Mutually exclusive with --mic, --loopback, and --app.
     #[arg(long)]
     wav: Option<PathBuf>,
     /// Capture from the default microphone.
     #[arg(long, default_value_t = false)]
     mic: bool,
+    /// Capture default system output (all apps on that device).
+    #[arg(long, default_value_t = false)]
+    loopback: bool,
+    /// Capture one application's output (name or bundle ID, macOS).
+    #[arg(long)]
+    app: Option<String>,
     /// Directory containing encoder/decoder/joiner/tokens.
     #[arg(long, default_value = DEFAULT_ASR_DIR)]
     model_dir: PathBuf,
@@ -79,6 +90,15 @@ struct TranslateArgs {
 
 #[derive(clap::Args, Debug)]
 struct LiveArgs {
+    /// Capture from the default microphone (the default when --loopback/--app is omitted).
+    #[arg(long, default_value_t = false)]
+    mic: bool,
+    /// Capture default system output (all apps on that device).
+    #[arg(long, default_value_t = false)]
+    loopback: bool,
+    /// Capture one application's output (name or bundle ID, macOS).
+    #[arg(long)]
+    app: Option<String>,
     /// Directory containing encoder/decoder/joiner/tokens.
     #[arg(long, default_value = DEFAULT_ASR_DIR)]
     asr_model_dir: PathBuf,
@@ -108,20 +128,19 @@ fn main() -> Result<()> {
         Command::Asr(args) => run_asr(args),
         Command::Translate(args) => run_translate(args),
         Command::Live(args) => run_live(args),
+        Command::Apps => run_apps(),
     }
 }
 
 fn run_asr(args: AsrArgs) -> Result<()> {
-    if args.wav.is_some() == args.mic {
-        anyhow::bail!("specify exactly one of --wav or --mic");
-    }
+    let source = asr_capture_source(&args)?;
     let paths = AsrModelPaths::from_dir(&args.model_dir)?;
     let mut engine = AsrEngine::new(&paths, args.threads, args.rule2)?;
 
     if let Some(wav) = args.wav {
         run_asr_wav(&mut engine, wav)?;
     } else {
-        run_asr_mic(&mut engine)?;
+        run_asr_capture(&mut engine, source.expect("live capture source"))?;
     }
     eprintln!("ASR metrics: {}", engine.metrics());
     Ok(())
@@ -144,14 +163,32 @@ fn run_asr_wav(engine: &mut AsrEngine, wav: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_asr_mic(engine: &mut AsrEngine) -> Result<()> {
+fn run_apps() -> Result<()> {
+    let apps = list_tappable_apps()?;
+    if apps.is_empty() {
+        println!("No running apps currently have Core Audio process objects.");
+        println!("Start playback in the app, then run this command again.");
+        return Ok(());
+    }
+    println!("Tappable apps (name / bundle ID / process objects):");
+    for app in apps {
+        println!(
+            "  {:<28}  {:<40}  {}",
+            app.name, app.bundle_id, app.process_count
+        );
+    }
+    Ok(())
+}
+
+fn run_asr_capture(engine: &mut AsrEngine, source: CaptureSource) -> Result<()> {
     let running = install_ctrlc()?;
-    let (capture, rx) = start_default_input(AUDIO_QUEUE_CAPACITY)?;
+    let label = capture_label(&source);
+    let (capture, rx) = start_capture(source, AUDIO_QUEUE_CAPACITY)?;
     let mut display = TranscriptDisplay::new();
     let mut buffer = Vec::new();
     let mut sample_rate = 0_u32;
 
-    println!("Streaming microphone ASR. Press Ctrl+C to stop.");
+    println!("Streaming {label} ASR. Press Ctrl+C to stop.");
     while running.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
@@ -205,12 +242,14 @@ fn run_translate(args: TranslateArgs) -> Result<()> {
 }
 
 fn run_live(args: LiveArgs) -> Result<()> {
+    let source = live_capture_source(&args)?;
     let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
     let mut engine = AsrEngine::new(&asr_paths, args.threads, args.rule2)?;
     let mut translator = OnnxMarianTranslator::from_dir(&args.mt_model_dir)?;
 
     let running = install_ctrlc()?;
-    let (capture, rx) = start_default_input(AUDIO_QUEUE_CAPACITY)?;
+    let label = capture_label(&source);
+    let (capture, rx) = start_capture(source, AUDIO_QUEUE_CAPACITY)?;
     let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
     let (done_tx, done_rx) = bounded::<()>(1);
 
@@ -235,7 +274,9 @@ fn run_live(args: LiveArgs) -> Result<()> {
     let mut sample_rate = 0_u32;
     let mut translation_queue_drops = 0_u64;
 
-    println!("Live EN->JA. Partials are English; finals are translated. Press Ctrl+C to stop.");
+    println!(
+        "Live EN->JA from {label}. Partials are English; finals are translated. Press Ctrl+C to stop."
+    );
     while running.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
@@ -277,6 +318,50 @@ fn run_live(args: LiveArgs) -> Result<()> {
         Err(_) => tracing::error!("translation thread panicked"),
     }
     Ok(())
+}
+
+fn asr_capture_source(args: &AsrArgs) -> Result<Option<CaptureSource>> {
+    let selected = usize::from(args.wav.is_some())
+        + usize::from(args.mic)
+        + usize::from(args.loopback)
+        + usize::from(args.app.is_some());
+    if selected != 1 {
+        anyhow::bail!("specify exactly one of --wav, --mic, --loopback, or --app");
+    }
+    if args.wav.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(selected_capture_source(
+        args.loopback,
+        args.app.as_deref(),
+    )))
+}
+
+fn live_capture_source(args: &LiveArgs) -> Result<CaptureSource> {
+    let selected =
+        usize::from(args.mic) + usize::from(args.loopback) + usize::from(args.app.is_some());
+    if selected > 1 {
+        anyhow::bail!("specify at most one of --mic, --loopback, or --app");
+    }
+    Ok(selected_capture_source(args.loopback, args.app.as_deref()))
+}
+
+fn selected_capture_source(loopback: bool, app: Option<&str>) -> CaptureSource {
+    if loopback {
+        CaptureSource::Loopback
+    } else if let Some(app) = app {
+        CaptureSource::Application(app.to_string())
+    } else {
+        CaptureSource::Microphone
+    }
+}
+
+fn capture_label(source: &CaptureSource) -> String {
+    match source {
+        CaptureSource::Microphone => "microphone".to_string(),
+        CaptureSource::Loopback => "system output".to_string(),
+        CaptureSource::Application(app) => format!("app {app}"),
+    }
 }
 
 fn enqueue_finals(tx: &crossbeam_channel::Sender<TranslationJob>, events: &[AsrEvent]) -> u64 {
