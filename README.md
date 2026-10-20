@@ -60,9 +60,9 @@ cargo run --release -- live --app "Google Chrome"
 cargo run --release -- live --loopback
 ```
 
-Endpoint trailing silence defaults to 0.8 s (`--rule2`). Lower it for faster subtitles, raise it to avoid cutting mid-sentence.
+Endpoint trailing silence defaults to 0.8 s (`--rule2`). Lower it for faster endpoints, raise it to avoid cutting mid-sentence.
 
-Live finals are VAD-gated, then Whisper-rescored, then translated. `--no-vad` and `--no-whisper` fall back toward the Zipformer-only path. Songs and heavy BGM still confuse ASR; skip those finals instead of emitting `ははは…` / `<unk>`.
+Japanese updates on the open tail while speech continues. A frozen row is committed before VAD closes the utterance. The open tail is a `JA:` line rewritten in place. A freeze appends an `EN:` line and a `JA:` line. After the utterance ends, Whisper may append a `FIX` pair. `--no-vad` and `--no-whisper` turn those models off. Songs and heavy BGM still confuse ASR. Junk English and Japanese are skipped. The 400 ms hold and the word caps stay in the program.
 
 `--app` and `--loopback` are macOS-only. `--app` records that application (including helpers/renderers and every tab). `--loopback` records every application on the default output. Keep Built-in Speakers as the output device for `--loopback`: USB interfaces and headsets that also have a microphone are rejected, because cpal would open their physical input instead of a tap.
 
@@ -81,6 +81,7 @@ Measured on this Apple Silicon machine (release build, not a 60-minute soak):
 src/audio.rs         microphone, app tap, system-output loopback, WAV
 src/macos_tap.rs     Core Audio process tap (macOS)
 src/asr.rs           sherpa-onnx OnlineRecognizer (beam search + utterance PCM)
+src/caption.rs       live caption document, Marian actor, stdout
 src/vad.rs           Silero VAD music gate
 src/whisper.rs       offline Whisper tiny.en rescorer
 src/text.rs          junk English / Japanese filters
