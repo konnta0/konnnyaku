@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::text;
 use crate::translation::{OnnxMarianTranslator, Translator};
@@ -263,7 +263,11 @@ impl Gate {
             .saturating_sub(last.map(|prev| word_count(prev.as_str())).unwrap_or(0))
             >= Self::PREVIEW_NEW_WORDS;
         let held = now.saturating_duration_since(changed_at) >= Self::PREVIEW_HOLD;
-        if grown || held { Some(english) } else { None }
+        if grown || held {
+            Some(english)
+        } else {
+            None
+        }
     }
 
     /// Cut the stable prefix only. The caller passes words shared with the previous hypothesis.
@@ -371,7 +375,6 @@ fn on_endpoint(
     } else if !remainder.is_empty() {
         doc.skipped_junk += 1;
     }
-    // Whisper corrects English that already passed the filter. It is not the first Japanese.
     let zipformer = EnglishSource::prepare(&frozen_prefix(doc));
     let mut effects = Effects::default();
     if doc.whisper {
@@ -991,7 +994,6 @@ fn actor_main(models: CaptionModels, heard_rx: Receiver<ActorMsg>) -> Result<Cap
             break;
         }
     }
-    // Queued Marian work is translated before the actor waits, so shutdown starts from an empty queue.
     if let Some(worker) = whisper_worker {
         worker.jobs.stop();
         let WhisperWorker { results, join, .. } = worker;
@@ -1178,7 +1180,7 @@ fn paint(frame: &Frame, out: &mut impl Write) -> io::Result<()> {
             if *lead_break {
                 writeln!(out)?;
             }
-            write!(out, "EN: {}\nJA: {}", english.as_str(), japanese.as_str())?;
+            write!(out, "EN: {}\nJA: {}\n", english.as_str(), japanese.as_str())?;
         }
         Frame::Fix {
             lead_break,
@@ -1190,7 +1192,7 @@ fn paint(frame: &Frame, out: &mut impl Write) -> io::Result<()> {
             }
             write!(
                 out,
-                "FIX\nEN: {}\nJA: {}",
+                "FIX\nEN: {}\nJA: {}\n",
                 english.as_str(),
                 japanese.as_str()
             )?;
@@ -1589,16 +1591,33 @@ mod tests {
         paint(
             &Frame::Fix {
                 lead_break: true,
-                english,
-                japanese,
+                english: english.clone(),
+                japanese: japanese.clone(),
             },
             &mut buf,
         )
         .expect("fix");
         let text = String::from_utf8(buf).expect("utf-8");
         assert!(text.starts_with("\rJA: サーバーを更新\x1b[K"));
-        assert!(text.contains("\nEN: update the server\nJA: サーバーを更新"));
-        assert!(text.contains("\nFIX\nEN: update the server\nJA: サーバーを更新"));
+        assert!(text.contains("\nEN: update the server\nJA: サーバーを更新\n"));
+        assert!(text.contains("\nFIX\nEN: update the server\nJA: サーバーを更新\n"));
         assert!(!text.contains("\u{1b}[A"));
+
+        let mut next = Vec::new();
+        paint(
+            &Frame::FreezeTail {
+                lead_break: false,
+                english: english.clone(),
+                japanese: japanese.clone(),
+            },
+            &mut next,
+        )
+        .expect("first freeze");
+        paint(&Frame::ShowTail(japanese.clone()), &mut next).expect("next tail");
+        let next = String::from_utf8(next).expect("utf-8");
+        assert!(
+            next.starts_with("EN: update the server\nJA: サーバーを更新\n\rJA: サーバーを更新"),
+            "a later tail must start after the frozen row, got {next:?}"
+        );
     }
 }
