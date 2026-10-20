@@ -1,5 +1,6 @@
 mod asr;
 mod audio;
+mod caption;
 mod metrics;
 mod text;
 mod translation;
