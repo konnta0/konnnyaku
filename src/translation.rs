@@ -11,7 +11,7 @@ use tokenizers::Tokenizer;
 use crate::metrics::TranslationMetrics;
 use crate::text;
 
-/// Translates finalized English utterances into Japanese.
+/// Translates English caption text into Japanese.
 pub trait Translator {
     /// Translate `text` from English to Japanese.
     fn translate(&mut self, text: &str) -> anyhow::Result<String>;

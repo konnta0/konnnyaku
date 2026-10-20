@@ -3,9 +3,18 @@
 //! `step` is the only lifecycle transition.
 
 use std::collections::{HashSet, VecDeque};
+use std::fmt::{self, Display, Formatter};
+use std::io::{self, Write};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender, bounded};
+
 use crate::text;
+use crate::translation::{OnnxMarianTranslator, Translator};
+use crate::whisper::WhisperRescorer;
 
 /// Boundary value. `run_live` builds this from `AsrEvent` and does not interpret it.
 pub enum Heard {
@@ -182,10 +191,12 @@ struct Effects {
 enum Frame {
     ShowTail(JapaneseCaption),
     FreezeTail {
+        lead_break: bool,
         english: EnglishSource,
         japanese: JapaneseCaption,
     },
     Fix {
+        lead_break: bool,
         english: EnglishSource,
         japanese: JapaneseCaption,
     },
@@ -493,7 +504,9 @@ fn paint_freeze(
         doc.skipped_junk += 1;
         return;
     };
+    let lead_break = !matches!(doc.screen, Screen::Blank);
     effects.frames.push(Frame::FreezeTail {
+        lead_break,
         english: english.clone(),
         japanese: caption,
     });
@@ -511,7 +524,9 @@ fn paint_fix(
         doc.skipped_junk += 1;
         return;
     };
+    let lead_break = !matches!(doc.screen, Screen::Blank);
     effects.frames.push(Frame::Fix {
+        lead_break,
         english: english.clone(),
         japanese: caption,
     });
@@ -712,6 +727,488 @@ fn cut_hard(text: &str) -> Option<Cut<'_>> {
         }
     }
     None
+}
+
+/// Models already loaded by `run_live`. The actor takes ownership.
+pub struct CaptionModels {
+    /// Marian EN→JA session.
+    pub translator: OnnxMarianTranslator,
+    /// Whisper tiny.en, when the rescorer loaded.
+    pub whisper: Option<WhisperRescorer>,
+}
+
+/// Counts printed by `run_live` on stderr after shutdown.
+pub struct CaptionReport {
+    /// Open tails that were painted.
+    pub previews: u64,
+    /// Frozen rows that were painted.
+    pub freezes: u64,
+    /// Whisper `FIX` pairs that were painted.
+    pub corrections: u64,
+    /// Revisions dropped because the mailbox was full.
+    pub dropped_revisions: u64,
+    /// English or Japanese text the filters rejected.
+    pub skipped_junk: u64,
+}
+
+impl Display for CaptionReport {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "previews={} freezes={} corrections={} dropped_revisions={} skipped_junk={}",
+            self.previews,
+            self.freezes,
+            self.corrections,
+            self.dropped_revisions,
+            self.skipped_junk
+        )
+    }
+}
+
+/// Caption owner. The capture thread sends [`Heard`]. This type does not print.
+pub struct LiveCaptions {
+    tx: Sender<ActorMsg>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    join: Option<JoinHandle<Result<CaptionReport>>>,
+}
+
+impl LiveCaptions {
+    /// Spawn the actor. It owns Marian, optional Whisper, the document, and stdout.
+    pub fn start(models: CaptionModels) -> Result<Self> {
+        let (tx, rx) = bounded(HEARD_CAPACITY);
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let join = std::thread::Builder::new()
+            .name("konnnyaku-captions".into())
+            .spawn(move || actor_main(models, rx))
+            .context("spawn caption actor")?;
+        Ok(Self {
+            tx,
+            dropped,
+            join: Some(join),
+        })
+    }
+
+    /// Enqueue one ASR observation. Revisions are lossy. Endpoints block.
+    pub fn hear(&self, heard: Heard) -> Result<()> {
+        use crossbeam_channel::TrySendError;
+        use std::sync::atomic::Ordering;
+
+        match heard {
+            Heard::Revision(text) => {
+                match self.tx.try_send(ActorMsg::Heard(Heard::Revision(text))) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(_)) => {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        anyhow::bail!("caption actor stopped")
+                    }
+                }
+            }
+            endpoint => {
+                self.tx
+                    .send(ActorMsg::Heard(endpoint))
+                    .context("caption actor stopped")?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Close the mailbox and join the actor.
+    pub fn finish(mut self) -> Result<CaptionReport> {
+        use std::sync::atomic::Ordering;
+
+        let _ = self.tx.send(ActorMsg::Shutdown);
+        let join = self.join.take().context("caption actor already joined")?;
+        let mut report = join
+            .join()
+            .map_err(|_| anyhow::anyhow!("caption actor panicked"))??;
+        report.dropped_revisions = self.dropped.load(Ordering::Relaxed);
+        Ok(report)
+    }
+}
+
+impl Drop for LiveCaptions {
+    fn drop(&mut self) {
+        let _ = self.tx.send(ActorMsg::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+const HEARD_CAPACITY: usize = 32;
+
+enum ActorMsg {
+    Heard(Heard),
+    Shutdown,
+}
+
+struct WhisperOut {
+    utterance: UtteranceId,
+    text: Option<String>,
+}
+
+/// One queued PCM buffer. A newer endpoint replaces a job the worker has not taken.
+struct WhisperSlot {
+    state: Mutex<WhisperState>,
+    notify: Condvar,
+}
+
+struct WhisperState {
+    job: Option<RescoreJob>,
+    stop: bool,
+}
+
+impl WhisperSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WhisperState {
+                job: None,
+                stop: false,
+            }),
+            notify: Condvar::new(),
+        }
+    }
+
+    fn submit(&self, job: RescoreJob) {
+        let mut guard = lock_slot(&self.state);
+        if guard.stop {
+            return;
+        }
+        guard.job = Some(job);
+        self.notify.notify_one();
+    }
+
+    fn recv(&self) -> Option<RescoreJob> {
+        let mut guard = lock_slot(&self.state);
+        loop {
+            if guard.stop {
+                return None;
+            }
+            if let Some(job) = guard.job.take() {
+                return Some(job);
+            }
+            guard = self
+                .notify
+                .wait(guard)
+                .unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    fn stop(&self) {
+        let mut guard = lock_slot(&self.state);
+        guard.stop = true;
+        self.notify.notify_one();
+    }
+}
+
+fn lock_slot(state: &Mutex<WhisperState>) -> std::sync::MutexGuard<'_, WhisperState> {
+    state.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+struct WhisperWorker {
+    jobs: Arc<WhisperSlot>,
+    results: Arc<ResultSlot>,
+    join: JoinHandle<()>,
+}
+
+/// Latest unread Whisper texts. The worker never blocks on the actor.
+struct ResultSlot {
+    values: Mutex<VecDeque<WhisperOut>>,
+}
+
+impl ResultSlot {
+    const CAPACITY: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            values: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn publish(&self, value: WhisperOut) {
+        let mut values = self.values.lock().unwrap_or_else(|err| err.into_inner());
+        if values.len() == Self::CAPACITY {
+            values.pop_front();
+        }
+        values.push_back(value);
+    }
+
+    fn take(&self) -> Option<WhisperOut> {
+        self.values
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .pop_front()
+    }
+}
+
+fn actor_main(models: CaptionModels, heard_rx: Receiver<ActorMsg>) -> Result<CaptionReport> {
+    let CaptionModels {
+        mut translator,
+        whisper,
+    } = models;
+    let mut doc = CaptionDocument::new(whisper.is_some());
+    let whisper_worker = match whisper {
+        Some(rescorer) => Some(spawn_whisper(rescorer)?),
+        None => None,
+    };
+    let mut stdout = io::stdout().lock();
+    loop {
+        let stop = crossbeam_channel::select! {
+            recv(heard_rx) -> msg => {
+                match msg {
+                    Ok(ActorMsg::Shutdown) | Err(_) => true,
+                    Ok(ActorMsg::Heard(heard)) => {
+                        let (inputs, stop) = coalesce(heard, &heard_rx);
+                        for input in inputs {
+                            drive(
+                                &mut doc,
+                                input,
+                                &mut translator,
+                                &mut stdout,
+                                whisper_worker.as_ref().map(|worker| worker.jobs.as_ref()),
+                            );
+                        }
+                        stop
+                    }
+                }
+            }
+            default(Duration::from_millis(100)) => {
+                let jobs = whisper_worker.as_ref().map(|worker| worker.jobs.as_ref());
+                drive(&mut doc, Input::Clock, &mut translator, &mut stdout, jobs);
+                let _ = drive_rescore(
+                    &mut doc,
+                    &mut translator,
+                    &mut stdout,
+                    whisper_worker.as_ref(),
+                );
+                false
+            }
+        };
+        if stop {
+            break;
+        }
+    }
+    // Queued Marian work is translated before the actor waits, so shutdown starts from an empty queue.
+    if let Some(worker) = whisper_worker {
+        worker.jobs.stop();
+        let WhisperWorker { results, join, .. } = worker;
+        let _ = join.join();
+        while let Some(done) = results.take() {
+            drive(
+                &mut doc,
+                Input::Rescored {
+                    utterance: done.utterance,
+                    text: done.text,
+                },
+                &mut translator,
+                &mut stdout,
+                None,
+            );
+        }
+    }
+    tracing::info!(metrics = %translator.metrics(), "caption actor stopped");
+    Ok(doc.report())
+}
+
+fn spawn_whisper(rescorer: WhisperRescorer) -> Result<WhisperWorker> {
+    let jobs = Arc::new(WhisperSlot::new());
+    let results = Arc::new(ResultSlot::new());
+    let jobs_for_thread = Arc::clone(&jobs);
+    let results_for_thread = Arc::clone(&results);
+    let join = std::thread::Builder::new()
+        .name("konnnyaku-whisper".into())
+        .spawn(move || whisper_loop(rescorer, jobs_for_thread, results_for_thread))
+        .context("spawn whisper thread")?;
+    Ok(WhisperWorker {
+        jobs,
+        results,
+        join,
+    })
+}
+
+fn drive_rescore(
+    doc: &mut CaptionDocument,
+    translator: &mut OnnxMarianTranslator,
+    out: &mut impl Write,
+    worker: Option<&WhisperWorker>,
+) -> bool {
+    let Some(worker) = worker else {
+        return false;
+    };
+    let Some(done) = worker.results.take() else {
+        return false;
+    };
+    drive(
+        doc,
+        Input::Rescored {
+            utterance: done.utterance,
+            text: done.text,
+        },
+        translator,
+        out,
+        Some(worker.jobs.as_ref()),
+    );
+    true
+}
+
+fn drive(
+    doc: &mut CaptionDocument,
+    input: Input,
+    translator: &mut OnnxMarianTranslator,
+    out: &mut impl Write,
+    slot: Option<&WhisperSlot>,
+) {
+    let mut effects = step(doc, input, Instant::now());
+    loop {
+        if let Some(job) = effects.rescore.take() {
+            if let Some(slot) = slot {
+                tracing::debug!(
+                    utterance = job.utterance.0,
+                    zipformer = job.zipformer.as_str(),
+                    "queue whisper rescore"
+                );
+                slot.submit(job);
+            }
+        }
+        for frame in &effects.frames {
+            if let Err(err) = paint(frame, out) {
+                tracing::warn!(%err, "caption write failed");
+            }
+        }
+        let Some(job) = effects.translate.take() else {
+            break;
+        };
+        let job_id = job.id();
+        let english = job.english().as_str().to_string();
+        match translator.translate(&english) {
+            Ok(japanese) => {
+                effects = step(
+                    doc,
+                    Input::Translated {
+                        job_id,
+                        japanese: Some(japanese),
+                    },
+                    Instant::now(),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(%err, "translation failed");
+                effects = step(doc, Input::Failed { job_id }, Instant::now());
+                let retried = effects
+                    .translate
+                    .as_ref()
+                    .is_some_and(|job| job.id() == job_id);
+                if !retried {
+                    tracing::warn!(job = job_id.0, "dropped translation after one retry");
+                }
+            }
+        }
+    }
+}
+
+fn coalesce(first: Heard, rx: &Receiver<ActorMsg>) -> (Vec<Input>, bool) {
+    let mut pending = vec![ActorMsg::Heard(first)];
+    let mut stop = false;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            ActorMsg::Shutdown => {
+                stop = true;
+                break;
+            }
+            other => pending.push(other),
+        }
+    }
+    let mut inputs = Vec::new();
+    let mut revision = None;
+    for msg in pending {
+        match msg {
+            ActorMsg::Heard(Heard::Revision(text)) => revision = Some(text),
+            ActorMsg::Heard(Heard::Endpoint {
+                text,
+                samples,
+                sample_rate,
+            }) => {
+                if let Some(text) = revision.take() {
+                    inputs.push(Input::Revision(text));
+                }
+                inputs.push(Input::Endpoint {
+                    text,
+                    samples,
+                    sample_rate,
+                });
+            }
+            ActorMsg::Shutdown => stop = true,
+        }
+    }
+    if let Some(text) = revision {
+        inputs.push(Input::Revision(text));
+    }
+    (inputs, stop)
+}
+
+fn whisper_loop(rescorer: WhisperRescorer, slot: Arc<WhisperSlot>, results: Arc<ResultSlot>) {
+    while let Some(job) = slot.recv() {
+        let text = match rescorer.transcribe(job.sample_rate, &job.samples) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!(%err, "whisper rescore failed");
+                None
+            }
+        };
+        results.publish(WhisperOut {
+            utterance: job.utterance,
+            text,
+        });
+    }
+}
+
+fn paint(frame: &Frame, out: &mut impl Write) -> io::Result<()> {
+    match frame {
+        Frame::ShowTail(japanese) => {
+            write!(out, "\rJA: {}\x1b[K", japanese.as_str())?;
+        }
+        Frame::FreezeTail {
+            lead_break,
+            english,
+            japanese,
+        } => {
+            if *lead_break {
+                writeln!(out)?;
+            }
+            write!(out, "EN: {}\nJA: {}", english.as_str(), japanese.as_str())?;
+        }
+        Frame::Fix {
+            lead_break,
+            english,
+            japanese,
+        } => {
+            if *lead_break {
+                writeln!(out)?;
+            }
+            write!(
+                out,
+                "FIX\nEN: {}\nJA: {}",
+                english.as_str(),
+                japanese.as_str()
+            )?;
+        }
+    }
+    out.flush()
+}
+
+impl CaptionDocument {
+    fn report(&self) -> CaptionReport {
+        CaptionReport {
+            previews: self.previews,
+            freezes: self.freezes,
+            corrections: self.corrections,
+            dropped_revisions: 0,
+            skipped_junk: self.skipped_junk,
+        }
+    }
 }
 
 fn accept_left<'a>(left: &'a str, right: &'a str) -> Option<Cut<'a>> {
@@ -1071,5 +1568,37 @@ mod tests {
         );
         assert!(late.translate.is_none());
         assert!(late.frames.is_empty());
+    }
+
+    #[test]
+    fn paint_appends_freeze_and_fix_without_cursor_up() {
+        let japanese = JapaneseCaption::keep("サーバー\r\nを更新").expect("japanese");
+        assert_eq!(japanese.as_str(), "サーバーを更新");
+        let english = EnglishSource::prepare("update the server").expect("english");
+        let mut buf = Vec::new();
+        paint(&Frame::ShowTail(japanese.clone()), &mut buf).expect("tail");
+        paint(
+            &Frame::FreezeTail {
+                lead_break: true,
+                english: english.clone(),
+                japanese: japanese.clone(),
+            },
+            &mut buf,
+        )
+        .expect("freeze");
+        paint(
+            &Frame::Fix {
+                lead_break: true,
+                english,
+                japanese,
+            },
+            &mut buf,
+        )
+        .expect("fix");
+        let text = String::from_utf8(buf).expect("utf-8");
+        assert!(text.starts_with("\rJA: サーバーを更新\x1b[K"));
+        assert!(text.contains("\nEN: update the server\nJA: サーバーを更新"));
+        assert!(text.contains("\nFIX\nEN: update the server\nJA: サーバーを更新"));
+        assert!(!text.contains("\u{1b}[A"));
     }
 }

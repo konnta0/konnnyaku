@@ -12,7 +12,7 @@ const JOINER_NAME: &str = "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx";
 const TOKENS_NAME: &str = "tokens.txt";
 const MAX_UTTERANCE_SECS: u32 = 30;
 
-/// Streaming ASR event. Only [`AsrEvent::Final`] should be translated.
+/// Streaming ASR event from Zipformer.
 #[derive(Debug)]
 pub enum AsrEvent {
     /// Unstable hypothesis for the current utterance.
