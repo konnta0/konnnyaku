@@ -1,7 +1,3 @@
-//! Live captions. Frozen spans are append-only for the open utterance.
-//! The tail is the unmatched suffix of the latest hypothesis.
-//! `step` is the only lifecycle transition.
-
 use std::collections::{HashSet, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
@@ -16,7 +12,6 @@ use crate::text;
 use crate::translation::{OnnxMarianTranslator, Translator};
 use crate::whisper::WhisperRescorer;
 
-/// Boundary value. `run_live` builds this from `AsrEvent` and does not interpret it.
 pub enum Heard {
     /// Full Zipformer hypothesis for the open utterance.
     Revision(String),
@@ -26,12 +21,10 @@ pub enum Heard {
         text: String,
         /// Speech-gated PCM for this utterance.
         samples: Vec<f32>,
-        /// Sample rate of `samples`.
         sample_rate: u32,
     },
 }
 
-/// English that already passed [`text::prepare_english`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EnglishSource(String);
 
@@ -46,7 +39,6 @@ impl EnglishSource {
     }
 }
 
-/// Japanese that passed [`text::keep_japanese`] and contains no control characters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct JapaneseCaption(String);
 
@@ -270,7 +262,6 @@ impl Gate {
         }
     }
 
-    /// Cut the stable prefix only. The caller passes words shared with the previous hypothesis.
     fn cut(stable: &str) -> Option<Cut<'_>> {
         if stable.is_empty() {
             return None;
@@ -732,15 +723,11 @@ fn cut_hard(text: &str) -> Option<Cut<'_>> {
     None
 }
 
-/// Models already loaded by `run_live`. The actor takes ownership.
 pub struct CaptionModels {
-    /// Marian EN→JA session.
     pub translator: OnnxMarianTranslator,
-    /// Whisper tiny.en, when the rescorer loaded.
     pub whisper: Option<WhisperRescorer>,
 }
 
-/// Counts printed by `run_live` on stderr after shutdown.
 pub struct CaptionReport {
     /// Open tails that were painted.
     pub previews: u64,
@@ -768,7 +755,6 @@ impl Display for CaptionReport {
     }
 }
 
-/// Caption owner. The capture thread sends [`Heard`]. This type does not print.
 pub struct LiveCaptions {
     tx: Sender<ActorMsg>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
@@ -853,7 +839,6 @@ struct WhisperOut {
     text: Option<String>,
 }
 
-/// One queued PCM buffer. A newer endpoint replaces a job the worker has not taken.
 struct WhisperSlot {
     state: Mutex<WhisperState>,
     notify: Condvar,
@@ -917,7 +902,6 @@ struct WhisperWorker {
     join: JoinHandle<()>,
 }
 
-/// Latest unread Whisper texts. The worker never blocks on the actor.
 struct ResultSlot {
     values: Mutex<VecDeque<WhisperOut>>,
 }
