@@ -2,16 +2,17 @@
 
 Fully local English speech → Japanese subtitle PoC for Apple Silicon.
 
-- ASR: sherpa-onnx streaming Zipformer (`sherpa-onnx-streaming-zipformer-en-2023-06-26`)
+- ASR: sherpa-onnx streaming Zipformer (`sherpa-onnx-streaming-zipformer-en-2023-06-26`) with `modified_beam_search`
+- Live quality: Silero VAD drops music/BGM, Whisper `tiny.en` rescores each final (punctuation included), junk English/Japanese is not translated
 - Translation: Marian-MT (`staka/fugumt-en-ja`) via ONNX Runtime.
   `Helsinki-NLP/opus-mt-en-jap` was measured first and is too weak on technical speech.
 - UI: CLI only. Inference does not use the network after models are downloaded.
-- Browser / YouTube: `--app "Google Chrome"` taps that app's output (all tabs). `--loopback` taps every app on the default output.
+- Browser / YouTube: `--app "Google Chrome"` taps that app's output (all tabs). `--loopback` taps every app on the default output. Speech and interviews work better than songs.
 
 ## Setup
 
 ```bash
-# English streaming ASR model (~300 MB)
+# Zipformer + Silero VAD + Whisper tiny.en (~420 MB)
 ./scripts/download-asr.sh
 
 # Marian EN→JA ONNX export (one-time; needs Python via uv)
@@ -61,6 +62,8 @@ cargo run --release -- live --loopback
 
 Endpoint trailing silence defaults to 0.8 s (`--rule2`). Lower it for faster subtitles, raise it to avoid cutting mid-sentence.
 
+Live finals are VAD-gated, then Whisper-rescored, then translated. `--no-vad` and `--no-whisper` fall back toward the Zipformer-only path. Songs and heavy BGM still confuse ASR; skip those finals instead of emitting `ははは…` / `<unk>`.
+
 `--app` and `--loopback` are macOS-only. `--app` records that application (including helpers/renderers and every tab). `--loopback` records every application on the default output. Keep Built-in Speakers as the output device for `--loopback`: USB interfaces and headsets that also have a microphone are rejected, because cpal would open their physical input instead of a tap.
 
 If you hear playback but captions stay silent, grant **System Audio Recording** (or Screen Recording on older macOS) to Terminal or Cursor in System Settings → Privacy & Security. Start audio in the target app before `--app`; `konnnyaku apps` only lists apps that currently have Core Audio process objects.
@@ -77,7 +80,10 @@ Measured on this Apple Silicon machine (release build, not a 60-minute soak):
 ```
 src/audio.rs         microphone, app tap, system-output loopback, WAV
 src/macos_tap.rs     Core Audio process tap (macOS)
-src/asr.rs           sherpa-onnx OnlineRecognizer
+src/asr.rs           sherpa-onnx OnlineRecognizer (beam search + utterance PCM)
+src/vad.rs           Silero VAD music gate
+src/whisper.rs       offline Whisper tiny.en rescorer
+src/text.rs          junk English / Japanese filters
 src/translation.rs   Translator + OnnxMarianTranslator
 src/metrics.rs       RTF and translation percentiles
 models/              gitignored weights

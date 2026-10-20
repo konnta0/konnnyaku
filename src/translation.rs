@@ -9,6 +9,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::metrics::TranslationMetrics;
+use crate::text;
 
 /// Translates finalized English utterances into Japanese.
 pub trait Translator {
@@ -228,7 +229,7 @@ impl Translator for OnnxMarianTranslator {
             .decode(&tokens, true)
             .map_err(|err| anyhow!("decode target: {err}"))?;
         self.metrics.record(start.elapsed());
-        Ok(cleanup_japanese(&japanese))
+        Ok(text::cleanup_japanese(&japanese))
     }
 }
 
@@ -350,8 +351,4 @@ fn argmax_last_token(logits: &Logits, banned_token: i64) -> Result<i64> {
         }
     }
     i64::try_from(best_idx).context("vocab index fits i64")
-}
-
-fn cleanup_japanese(text: &str) -> String {
-    text.replace(['▁', ' '], "").trim().to_string()
 }

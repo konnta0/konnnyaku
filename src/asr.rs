@@ -4,19 +4,32 @@ use anyhow::{Context, Result, anyhow};
 use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig};
 
 use crate::metrics::AsrMetrics;
+use crate::vad::{SpeechDecision, SpeechGate};
 
 const ENCODER_NAME: &str = "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx";
 const DECODER_NAME: &str = "decoder-epoch-99-avg-1-chunk-16-left-128.onnx";
 const JOINER_NAME: &str = "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx";
 const TOKENS_NAME: &str = "tokens.txt";
+const MAX_UTTERANCE_SECS: u32 = 30;
 
 /// Streaming ASR event. Only [`AsrEvent::Final`] should be translated.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum AsrEvent {
     /// Unstable hypothesis for the current utterance.
     Partial(String),
-    /// Endpoint-confirmed transcript.
-    Final(String),
+    /// Endpoint-confirmed transcript plus the speech audio used to produce it.
+    Final(FinalUtterance),
+}
+
+/// One endpoint-confirmed utterance, with PCM for optional Whisper rescoring.
+#[derive(Debug)]
+pub struct FinalUtterance {
+    /// Zipformer transcript at endpoint time.
+    pub text: String,
+    /// Speech-gated PCM for this utterance (capture sample rate).
+    pub samples: Vec<f32>,
+    /// Sample rate of [`Self::samples`].
+    pub sample_rate: u32,
 }
 
 /// File layout for the English Zipformer transducer.
@@ -69,6 +82,11 @@ pub struct AsrEngine {
     stream: sherpa_onnx::OnlineStream,
     metrics: AsrMetrics,
     last_text: String,
+    last_emitted: String,
+    skip_repeat: bool,
+    utterance: Vec<f32>,
+    utterance_rate: u32,
+    vad: Option<SpeechGate>,
 }
 
 impl AsrEngine {
@@ -87,7 +105,8 @@ impl AsrEngine {
         config.model_config.num_threads = num_threads.max(1);
         config.model_config.debug = false;
         config.enable_endpoint = true;
-        config.decoding_method = Some("greedy_search".to_string());
+        config.decoding_method = Some("modified_beam_search".to_string());
+        config.max_active_paths = 4;
         config.rule1_min_trailing_silence = 2.4;
         config.rule2_min_trailing_silence = rule2_min_trailing_silence;
         config.rule3_min_utterance_length = 20.0;
@@ -100,29 +119,56 @@ impl AsrEngine {
             stream,
             metrics: AsrMetrics::new(),
             last_text: String::new(),
+            last_emitted: String::new(),
+            skip_repeat: false,
+            utterance: Vec::new(),
+            utterance_rate: 0,
+            vad: None,
         })
+    }
+
+    /// Gate Zipformer with Silero so music is not decoded as English.
+    pub fn set_vad(&mut self, vad: SpeechGate) {
+        self.vad = Some(vad);
     }
 
     /// Feed a PCM chunk. Sherpa resamples to 16 kHz internally.
     pub fn push_samples(&mut self, sample_rate: u32, samples: &[f32]) -> Result<Vec<AsrEvent>> {
         self.metrics.add_audio_samples(samples.len(), sample_rate);
-        self.stream.accept_waveform(
-            i32::try_from(sample_rate).context("sample rate fits i32")?,
-            samples,
-        );
-        Ok(self.poll())
+
+        let decision = self
+            .vad
+            .as_mut()
+            .map(|vad| vad.push(sample_rate, samples))
+            .unwrap_or(SpeechDecision {
+                active: true,
+                ended: false,
+            });
+
+        if decision.active {
+            self.append_utterance(sample_rate, samples);
+            self.skip_repeat = false;
+            self.stream.accept_waveform(
+                i32::try_from(sample_rate).context("sample rate fits i32")?,
+                samples,
+            );
+            return Ok(self.poll());
+        }
+
+        if decision.ended {
+            return Ok(self.finalize_utterance());
+        }
+
+        Ok(Vec::new())
     }
 
     /// Flush trailing audio after a file or capture stop.
     pub fn finish_input(&mut self) -> Result<Vec<AsrEvent>> {
-        self.stream.input_finished();
-        let mut events = self.poll();
-        if !self.last_text.is_empty() {
-            let text = std::mem::take(&mut self.last_text);
-            events.push(AsrEvent::Final(text));
-            self.recognizer.reset(&self.stream);
+        if let Some(vad) = self.vad.as_mut() {
+            let _ = vad.flush();
         }
-        Ok(events)
+        self.stream.input_finished();
+        Ok(self.finalize_utterance())
     }
 
     /// Current ASR timing / drop counters.
@@ -135,6 +181,41 @@ impl AsrEngine {
         &mut self.metrics
     }
 
+    fn append_utterance(&mut self, sample_rate: u32, samples: &[f32]) {
+        if self.utterance_rate != 0 && self.utterance_rate != sample_rate {
+            self.utterance.clear();
+        }
+        self.utterance_rate = sample_rate;
+        self.utterance.extend_from_slice(samples);
+        let max_samples = (sample_rate as usize).saturating_mul(MAX_UTTERANCE_SECS as usize);
+        if self.utterance.len() > max_samples {
+            let drop = self.utterance.len() - max_samples;
+            self.utterance.drain(..drop);
+        }
+    }
+
+    fn finalize_utterance(&mut self) -> Vec<AsrEvent> {
+        let mut events = self.poll();
+        if !self.last_text.is_empty() {
+            events.push(self.take_final());
+            self.recognizer.reset(&self.stream);
+            self.skip_repeat = true;
+        } else {
+            self.utterance.clear();
+        }
+        events
+    }
+
+    fn take_final(&mut self) -> AsrEvent {
+        let text = std::mem::take(&mut self.last_text);
+        self.last_emitted = text.clone();
+        AsrEvent::Final(FinalUtterance {
+            text,
+            samples: std::mem::take(&mut self.utterance),
+            sample_rate: self.utterance_rate,
+        })
+    }
+
     fn poll(&mut self) -> Vec<AsrEvent> {
         let mut events = Vec::new();
         while self.recognizer.is_ready(&self.stream) {
@@ -144,7 +225,8 @@ impl AsrEngine {
 
             if let Some(result) = self.recognizer.get_result(&self.stream) {
                 let text = result.text.trim();
-                if !text.is_empty() && text != self.last_text {
+                let echo = self.skip_repeat && text == self.last_emitted;
+                if !text.is_empty() && text != self.last_text && !echo {
                     self.last_text = text.to_string();
                     events.push(AsrEvent::Partial(self.last_text.clone()));
                 }
@@ -152,10 +234,12 @@ impl AsrEngine {
 
             if self.recognizer.is_endpoint(&self.stream) {
                 if !self.last_text.is_empty() {
-                    let text = std::mem::take(&mut self.last_text);
-                    events.push(AsrEvent::Final(text));
+                    events.push(self.take_final());
+                } else {
+                    self.utterance.clear();
                 }
                 self.recognizer.reset(&self.stream);
+                self.skip_repeat = true;
             }
         }
         events

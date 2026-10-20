@@ -1,7 +1,10 @@
 mod asr;
 mod audio;
 mod metrics;
+mod text;
 mod translation;
+mod vad;
+mod whisper;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -14,13 +17,15 @@ use clap::{Parser, Subcommand};
 use crossbeam_channel::{RecvTimeoutError, bounded};
 use tracing_subscriber::EnvFilter;
 
-use crate::asr::{AsrEngine, AsrEvent, AsrModelPaths};
+use crate::asr::{AsrEngine, AsrEvent, AsrModelPaths, FinalUtterance};
 use crate::audio::{
     CaptureSource, chunk_samples, list_tappable_apps, load_wav_mono_f32, samples_for_ms,
     start_capture,
 };
 use crate::metrics::TranslationMetrics;
 use crate::translation::{OnnxMarianTranslator, Translator};
+use crate::vad::SpeechGate;
+use crate::whisper::WhisperRescorer;
 
 const DEFAULT_ASR_DIR: &str = "models/asr/zipformer-en";
 const DEFAULT_MT_DIR: &str = "models/translation/marian-en-ja/onnx";
@@ -111,10 +116,24 @@ struct LiveArgs {
     /// ONNX Runtime threads inside sherpa-onnx.
     #[arg(long, default_value_t = 2)]
     threads: i32,
+    /// Directory containing Whisper tiny.en encoder/decoder/tokens.
+    #[arg(long, default_value = "models/asr/whisper-tiny.en")]
+    whisper_dir: PathBuf,
+    /// Silero VAD ONNX path.
+    #[arg(long, default_value = "models/asr/silero_vad.onnx")]
+    vad_model: PathBuf,
+    /// Disable Whisper rescoring of Zipformer finals.
+    #[arg(long, default_value_t = false)]
+    no_whisper: bool,
+    /// Disable Silero VAD music suppression.
+    #[arg(long, default_value_t = false)]
+    no_vad: bool,
 }
 
 struct TranslationJob {
-    english: String,
+    zipformer: String,
+    samples: Vec<f32>,
+    sample_rate: u32,
     utterance_ended: Instant,
 }
 
@@ -245,6 +264,29 @@ fn run_live(args: LiveArgs) -> Result<()> {
     let source = live_capture_source(&args)?;
     let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
     let mut engine = AsrEngine::new(&asr_paths, args.threads, args.rule2)?;
+    if !args.no_vad {
+        match SpeechGate::from_path(&args.vad_model) {
+            Ok(vad) => engine.set_vad(vad),
+            Err(err) => tracing::warn!(
+                %err,
+                "Silero VAD unavailable; music will leak into Zipformer"
+            ),
+        }
+    }
+    let whisper = if args.no_whisper {
+        None
+    } else {
+        match WhisperRescorer::from_dir(&args.whisper_dir, args.threads) {
+            Ok(rescorer) => Some(rescorer),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "Whisper rescorer unavailable; finals stay Zipformer-only"
+                );
+                None
+            }
+        }
+    };
     let mut translator = OnnxMarianTranslator::from_dir(&args.mt_model_dir)?;
 
     let running = install_ctrlc()?;
@@ -256,13 +298,12 @@ fn run_live(args: LiveArgs) -> Result<()> {
     let mt_thread = std::thread::spawn(move || -> Result<TranslationMetrics> {
         let mut e2e = TranslationMetrics::new()?;
         while let Ok(job) = mt_rx.recv() {
-            match translator.translate(&job.english) {
-                Ok(japanese) => {
-                    e2e.record(job.utterance_ended.elapsed());
-                    println!("JA: {japanese}");
-                    let _ = io::stdout().flush();
+            match caption_final(&whisper, &mut translator, job) {
+                Ok(Some(metrics_elapsed)) => {
+                    e2e.record(metrics_elapsed);
                 }
-                Err(err) => tracing::error!(%err, "translation failed"),
+                Ok(None) => {}
+                Err(err) => tracing::error!(%err, "caption failed"),
             }
         }
         let _ = done_tx.send(());
@@ -275,7 +316,7 @@ fn run_live(args: LiveArgs) -> Result<()> {
     let mut translation_queue_drops = 0_u64;
 
     println!(
-        "Live EN->JA from {label}. Partials are English; finals are translated. Press Ctrl+C to stop."
+        "Live EN->JA from {label}. Partials are Zipformer; finals are VAD-gated, Whisper-rescored, then translated. Press Ctrl+C to stop."
     );
     while running.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -286,8 +327,7 @@ fn run_live(args: LiveArgs) -> Result<()> {
                 while buffer.len() >= chunk_len {
                     let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
                     let events = engine.push_samples(sample_rate, &samples)?;
-                    translation_queue_drops += enqueue_finals(&mt_tx, &events);
-                    display.handle(events);
+                    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -297,12 +337,10 @@ fn run_live(args: LiveArgs) -> Result<()> {
 
     if sample_rate > 0 && !buffer.is_empty() {
         let events = engine.push_samples(sample_rate, &buffer)?;
-        translation_queue_drops += enqueue_finals(&mt_tx, &events);
-        display.handle(events);
+        translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
     }
     let events = engine.finish_input()?;
-    translation_queue_drops += enqueue_finals(&mt_tx, &events);
-    display.handle(events);
+    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
     display.finish();
 
     drop(mt_tx);
@@ -364,20 +402,65 @@ fn capture_label(source: &CaptureSource) -> String {
     }
 }
 
-fn enqueue_finals(tx: &crossbeam_channel::Sender<TranslationJob>, events: &[AsrEvent]) -> u64 {
+fn enqueue_finals(
+    tx: &crossbeam_channel::Sender<TranslationJob>,
+    events: Vec<AsrEvent>,
+    display: &mut TranscriptDisplay,
+) -> u64 {
     let mut drops = 0;
     for event in events {
-        if let AsrEvent::Final(english) = event {
-            match tx.try_send(TranslationJob {
-                english: english.clone(),
-                utterance_ended: Instant::now(),
-            }) {
-                Ok(()) => {}
-                Err(_) => drops += 1,
+        match event {
+            AsrEvent::Partial(text) => display.partial(text),
+            AsrEvent::Final(utterance) => {
+                display.clear_partial();
+                match tx.try_send(TranslationJob {
+                    zipformer: utterance.text,
+                    samples: utterance.samples,
+                    sample_rate: utterance.sample_rate,
+                    utterance_ended: Instant::now(),
+                }) {
+                    Ok(()) => {}
+                    Err(_) => drops += 1,
+                }
             }
         }
     }
     drops
+}
+
+fn caption_final(
+    whisper: &Option<WhisperRescorer>,
+    translator: &mut OnnxMarianTranslator,
+    job: TranslationJob,
+) -> Result<Option<Duration>> {
+    let english = rescore_english(whisper, &job)?;
+    let Some(english) = text::prepare_english(&english) else {
+        tracing::debug!(zipformer = %job.zipformer, "skipped junk English");
+        return Ok(None);
+    };
+
+    println!("EN: {english}");
+    let _ = io::stdout().flush();
+
+    let japanese = translator.translate(&english)?;
+    let elapsed = job.utterance_ended.elapsed();
+    if let Some(japanese) = text::keep_japanese(&japanese) {
+        println!("JA: {japanese}");
+        let _ = io::stdout().flush();
+    } else {
+        tracing::debug!(%english, "skipped junk Japanese");
+    }
+    Ok(Some(elapsed))
+}
+
+fn rescore_english(whisper: &Option<WhisperRescorer>, job: &TranslationJob) -> Result<String> {
+    let Some(whisper) = whisper else {
+        return Ok(job.zipformer.clone());
+    };
+    match whisper.transcribe(job.sample_rate, &job.samples)? {
+        Some(text) => Ok(text),
+        None => Ok(job.zipformer.clone()),
+    }
 }
 
 fn install_ctrlc() -> Result<Arc<AtomicBool>> {
@@ -404,20 +487,26 @@ impl TranscriptDisplay {
     fn handle(&mut self, events: Vec<AsrEvent>) {
         for event in events {
             match event {
-                AsrEvent::Partial(text) => {
-                    self.last_partial = text;
-                    print!("\rEN: {}", self.last_partial);
-                    let _ = io::stdout().flush();
-                }
-                AsrEvent::Final(text) => {
-                    if !self.last_partial.is_empty() {
-                        print!("\r");
-                    }
+                AsrEvent::Partial(text) => self.partial(text),
+                AsrEvent::Final(FinalUtterance { text, .. }) => {
+                    self.clear_partial();
                     println!("EN: {text}");
-                    self.last_partial.clear();
                     let _ = io::stdout().flush();
                 }
             }
+        }
+    }
+
+    fn partial(&mut self, text: String) {
+        self.last_partial = text;
+        print!("\rEN: {}", self.last_partial);
+        let _ = io::stdout().flush();
+    }
+
+    fn clear_partial(&mut self) {
+        if !self.last_partial.is_empty() {
+            print!("\r");
+            self.last_partial.clear();
         }
     }
 
