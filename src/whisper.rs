@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineWhisperModelConfig};
 
-/// Offline Whisper used to rescore Zipformer finals before translation.
 pub struct WhisperRescorer {
     recognizer: OfflineRecognizer,
 }

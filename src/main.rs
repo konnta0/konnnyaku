@@ -1,5 +1,6 @@
 mod asr;
 mod audio;
+mod caption;
 mod metrics;
 mod text;
 mod translation;
@@ -10,11 +11,11 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{RecvTimeoutError, bounded};
+use crossbeam_channel::RecvTimeoutError;
 use tracing_subscriber::EnvFilter;
 
 use crate::asr::{AsrEngine, AsrEvent, AsrModelPaths, FinalUtterance};
@@ -22,7 +23,7 @@ use crate::audio::{
     CaptureSource, chunk_samples, list_tappable_apps, load_wav_mono_f32, samples_for_ms,
     start_capture,
 };
-use crate::metrics::TranslationMetrics;
+use crate::caption::{CaptionModels, Heard, LiveCaptions};
 use crate::translation::{OnnxMarianTranslator, Translator};
 use crate::vad::SpeechGate;
 use crate::whisper::WhisperRescorer;
@@ -30,7 +31,6 @@ use crate::whisper::WhisperRescorer;
 const DEFAULT_ASR_DIR: &str = "models/asr/zipformer-en";
 const DEFAULT_MT_DIR: &str = "models/translation/marian-en-ja/onnx";
 const AUDIO_QUEUE_CAPACITY: usize = 50;
-const TRANSLATION_QUEUE_CAPACITY: usize = 8;
 const CHUNK_MS: u32 = 200;
 
 #[derive(Parser, Debug)]
@@ -49,7 +49,7 @@ enum Command {
     Asr(AsrArgs),
     /// Translate English text with the local Marian ONNX model.
     Translate(TranslateArgs),
-    /// Live ASR with Japanese subtitles for finalized utterances.
+    /// Live English speech to Japanese subtitles.
     Live(LiveArgs),
     /// List running apps that currently have tappable audio output.
     Apps,
@@ -128,13 +128,6 @@ struct LiveArgs {
     /// Disable Silero VAD music suppression.
     #[arg(long, default_value_t = false)]
     no_vad: bool,
-}
-
-struct TranslationJob {
-    zipformer: String,
-    samples: Vec<f32>,
-    sample_rate: u32,
-    utterance_ended: Instant,
 }
 
 fn main() -> Result<()> {
@@ -281,79 +274,70 @@ fn run_live(args: LiveArgs) -> Result<()> {
             Err(err) => {
                 tracing::warn!(
                     %err,
-                    "Whisper rescorer unavailable; finals stay Zipformer-only"
+                    "Whisper rescorer unavailable; captions stay on the Zipformer text"
                 );
                 None
             }
         }
     };
-    let mut translator = OnnxMarianTranslator::from_dir(&args.mt_model_dir)?;
+    let translator = OnnxMarianTranslator::from_dir(&args.mt_model_dir)?;
 
     let running = install_ctrlc()?;
     let label = capture_label(&source);
     let (capture, rx) = start_capture(source, AUDIO_QUEUE_CAPACITY)?;
-    let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
-    let (done_tx, done_rx) = bounded::<()>(1);
+    println!(
+        "Live EN->JA from {label}. Japanese updates while speech continues. Press Ctrl+C to stop."
+    );
+    let captions = LiveCaptions::start(CaptionModels {
+        translator,
+        whisper,
+    })?;
 
-    let mt_thread = std::thread::spawn(move || -> Result<TranslationMetrics> {
-        let mut e2e = TranslationMetrics::new()?;
-        while let Ok(job) = mt_rx.recv() {
-            match caption_final(&whisper, &mut translator, job) {
-                Ok(Some(metrics_elapsed)) => {
-                    e2e.record(metrics_elapsed);
-                }
-                Ok(None) => {}
-                Err(err) => tracing::error!(%err, "caption failed"),
-            }
-        }
-        let _ = done_tx.send(());
-        Ok(e2e)
-    });
-
-    let mut display = TranscriptDisplay::new();
     let mut buffer = Vec::new();
     let mut sample_rate = 0_u32;
-    let mut translation_queue_drops = 0_u64;
-
-    println!(
-        "Live EN->JA from {label}. Partials are Zipformer; finals are VAD-gated, Whisper-rescored, then translated. Press Ctrl+C to stop."
-    );
-    while running.load(Ordering::SeqCst) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => {
-                sample_rate = chunk.sample_rate;
-                buffer.extend_from_slice(&chunk.samples);
-                let chunk_len = samples_for_ms(sample_rate, CHUNK_MS).max(1);
-                while buffer.len() >= chunk_len {
-                    let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
-                    let events = engine.push_samples(sample_rate, &samples)?;
-                    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
+    let run_result = (|| -> Result<()> {
+        while running.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => {
+                    sample_rate = chunk.sample_rate;
+                    buffer.extend_from_slice(&chunk.samples);
+                    let chunk_len = samples_for_ms(sample_rate, CHUNK_MS).max(1);
+                    while buffer.len() >= chunk_len {
+                        let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
+                        hear_events(&captions, engine.push_samples(sample_rate, &samples)?)?;
+                    }
                 }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
         }
-    }
 
-    if sample_rate > 0 && !buffer.is_empty() {
-        let events = engine.push_samples(sample_rate, &buffer)?;
-        translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
-    }
-    let events = engine.finish_input()?;
-    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
-    display.finish();
+        if sample_rate > 0 && !buffer.is_empty() {
+            hear_events(&captions, engine.push_samples(sample_rate, &buffer)?)?;
+        }
+        hear_events(&captions, engine.finish_input()?)?;
+        Ok(())
+    })();
 
-    drop(mt_tx);
-    let _ = done_rx.recv_timeout(Duration::from_secs(30));
+    let report = captions.finish();
     engine.metrics_mut().add_drops(capture.drops());
     drop(capture);
-
+    run_result?;
     eprintln!("ASR metrics: {}", engine.metrics());
-    eprintln!("translation queue drops: {translation_queue_drops}");
-    match mt_thread.join() {
-        Ok(Ok(e2e)) => eprintln!("utterance-end to subtitle: {e2e}"),
-        Ok(Err(err)) => tracing::error!(%err, "translation thread failed"),
-        Err(_) => tracing::error!("translation thread panicked"),
+    eprintln!("captions: {}", report?);
+    Ok(())
+}
+
+fn hear_events(captions: &LiveCaptions, events: Vec<AsrEvent>) -> Result<()> {
+    for event in events {
+        match event {
+            AsrEvent::Partial(text) => captions.hear(Heard::Revision(text))?,
+            AsrEvent::Final(utterance) => captions.hear(Heard::Endpoint {
+                text: utterance.text,
+                samples: utterance.samples,
+                sample_rate: utterance.sample_rate,
+            })?,
+        }
     }
     Ok(())
 }
@@ -399,67 +383,6 @@ fn capture_label(source: &CaptureSource) -> String {
         CaptureSource::Microphone => "microphone".to_string(),
         CaptureSource::Loopback => "system output".to_string(),
         CaptureSource::Application(app) => format!("app {app}"),
-    }
-}
-
-fn enqueue_finals(
-    tx: &crossbeam_channel::Sender<TranslationJob>,
-    events: Vec<AsrEvent>,
-    display: &mut TranscriptDisplay,
-) -> u64 {
-    let mut drops = 0;
-    for event in events {
-        match event {
-            AsrEvent::Partial(text) => display.partial(text),
-            AsrEvent::Final(utterance) => {
-                display.clear_partial();
-                match tx.try_send(TranslationJob {
-                    zipformer: utterance.text,
-                    samples: utterance.samples,
-                    sample_rate: utterance.sample_rate,
-                    utterance_ended: Instant::now(),
-                }) {
-                    Ok(()) => {}
-                    Err(_) => drops += 1,
-                }
-            }
-        }
-    }
-    drops
-}
-
-fn caption_final(
-    whisper: &Option<WhisperRescorer>,
-    translator: &mut OnnxMarianTranslator,
-    job: TranslationJob,
-) -> Result<Option<Duration>> {
-    let english = rescore_english(whisper, &job)?;
-    let Some(english) = text::prepare_english(&english) else {
-        tracing::debug!(zipformer = %job.zipformer, "skipped junk English");
-        return Ok(None);
-    };
-
-    println!("EN: {english}");
-    let _ = io::stdout().flush();
-
-    let japanese = translator.translate(&english)?;
-    let elapsed = job.utterance_ended.elapsed();
-    if let Some(japanese) = text::keep_japanese(&japanese) {
-        println!("JA: {japanese}");
-        let _ = io::stdout().flush();
-    } else {
-        tracing::debug!(%english, "skipped junk Japanese");
-    }
-    Ok(Some(elapsed))
-}
-
-fn rescore_english(whisper: &Option<WhisperRescorer>, job: &TranslationJob) -> Result<String> {
-    let Some(whisper) = whisper else {
-        return Ok(job.zipformer.clone());
-    };
-    match whisper.transcribe(job.sample_rate, &job.samples)? {
-        Some(text) => Ok(text),
-        None => Ok(job.zipformer.clone()),
     }
 }
 
