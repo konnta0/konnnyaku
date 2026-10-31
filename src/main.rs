@@ -1,6 +1,7 @@
 mod asr;
 mod audio;
 mod metrics;
+mod summary;
 mod text;
 mod translation;
 mod vad;
@@ -8,21 +9,22 @@ mod whisper;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{RecvTimeoutError, bounded};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
 use tracing_subscriber::EnvFilter;
 
 use crate::asr::{AsrEngine, AsrEvent, AsrModelPaths, FinalUtterance};
 use crate::audio::{
-    CaptureSource, chunk_samples, list_tappable_apps, load_wav_mono_f32, samples_for_ms,
-    start_capture,
+    chunk_samples, list_tappable_apps, load_wav_mono_f32, samples_for_ms, start_capture,
+    AudioCapture, AudioChunk, CaptureSource,
 };
 use crate::metrics::TranslationMetrics;
+use crate::summary::SummarySession;
 use crate::translation::{OnnxMarianTranslator, Translator};
 use crate::vad::SpeechGate;
 use crate::whisper::WhisperRescorer;
@@ -51,6 +53,8 @@ enum Command {
     Translate(TranslateArgs),
     /// Live ASR with Japanese subtitles for finalized utterances.
     Live(LiveArgs),
+    /// Summarize microphone speech. This does not translate playback.
+    Summary(SummaryArgs),
     /// List running apps that currently have tappable audio output.
     Apps,
 }
@@ -130,6 +134,37 @@ struct LiveArgs {
     no_vad: bool,
 }
 
+#[derive(clap::Args, Debug)]
+struct SummaryArgs {
+    /// 16-bit or 32-bit WAV path. Omit this to capture the default microphone.
+    #[arg(long)]
+    wav: Option<PathBuf>,
+    /// Directory containing encoder/decoder/joiner/tokens.
+    #[arg(long, default_value = DEFAULT_ASR_DIR)]
+    asr_model_dir: PathBuf,
+    /// Directory containing encoder/decoder ONNX and tokenizers.
+    #[arg(long, default_value = DEFAULT_MT_DIR)]
+    mt_model_dir: PathBuf,
+    /// Endpoint rule2 trailing silence in seconds.
+    #[arg(long, default_value_t = 0.8)]
+    rule2: f32,
+    /// ONNX Runtime threads inside sherpa-onnx.
+    #[arg(long, default_value_t = 2)]
+    threads: i32,
+    /// Directory containing Whisper tiny.en encoder/decoder/tokens.
+    #[arg(long, default_value = "models/asr/whisper-tiny.en")]
+    whisper_dir: PathBuf,
+    /// Silero VAD ONNX path.
+    #[arg(long, default_value = "models/asr/silero_vad.onnx")]
+    vad_model: PathBuf,
+    /// Disable Whisper rescoring of Zipformer finals.
+    #[arg(long, default_value_t = false)]
+    no_whisper: bool,
+    /// Disable Silero VAD music suppression.
+    #[arg(long, default_value_t = false)]
+    no_vad: bool,
+}
+
 struct TranslationJob {
     zipformer: String,
     samples: Vec<f32>,
@@ -147,6 +182,7 @@ fn main() -> Result<()> {
         Command::Asr(args) => run_asr(args),
         Command::Translate(args) => run_translate(args),
         Command::Live(args) => run_live(args),
+        Command::Summary(args) => run_summary(args),
         Command::Apps => run_apps(),
     }
 }
@@ -202,10 +238,11 @@ fn run_apps() -> Result<()> {
 fn run_asr_capture(engine: &mut AsrEngine, source: CaptureSource) -> Result<()> {
     let running = install_ctrlc()?;
     let label = capture_label(&source);
-    let (capture, rx) = start_capture(source, AUDIO_QUEUE_CAPACITY)?;
+    let (mut capture, mut rx) = start_capture(source.clone(), AUDIO_QUEUE_CAPACITY)?;
     let mut display = TranscriptDisplay::new();
     let mut buffer = Vec::new();
     let mut sample_rate = 0_u32;
+    let mut capture_drops = 0_u64;
 
     println!("Streaming {label} ASR. Press Ctrl+C to stop.");
     while running.load(Ordering::SeqCst) {
@@ -219,8 +256,12 @@ fn run_asr_capture(engine: &mut AsrEngine, source: CaptureSource) -> Result<()> 
                     display.handle(engine.push_samples(sample_rate, &samples)?);
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                capture_drops += reconnect_capture(&mut capture, &mut rx, &source, false)?;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                capture_drops += reconnect_capture(&mut capture, &mut rx, &source, true)?;
+            }
         }
     }
 
@@ -229,7 +270,9 @@ fn run_asr_capture(engine: &mut AsrEngine, source: CaptureSource) -> Result<()> 
     }
     display.handle(engine.finish_input()?);
     display.finish();
-    engine.metrics_mut().add_drops(capture.drops());
+    engine
+        .metrics_mut()
+        .add_drops(capture_drops + capture.drops());
     drop(capture);
     Ok(())
 }
@@ -291,7 +334,7 @@ fn run_live(args: LiveArgs) -> Result<()> {
 
     let running = install_ctrlc()?;
     let label = capture_label(&source);
-    let (capture, rx) = start_capture(source, AUDIO_QUEUE_CAPACITY)?;
+    let (mut capture, mut rx) = start_capture(source.clone(), AUDIO_QUEUE_CAPACITY)?;
     let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
     let (done_tx, done_rx) = bounded::<()>(1);
 
@@ -314,6 +357,7 @@ fn run_live(args: LiveArgs) -> Result<()> {
     let mut buffer = Vec::new();
     let mut sample_rate = 0_u32;
     let mut translation_queue_drops = 0_u64;
+    let mut capture_drops = 0_u64;
 
     println!(
         "Live EN->JA from {label}. Partials are Zipformer; finals are VAD-gated, Whisper-rescored, then translated. Press Ctrl+C to stop."
@@ -330,8 +374,12 @@ fn run_live(args: LiveArgs) -> Result<()> {
                     translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                capture_drops += reconnect_capture(&mut capture, &mut rx, &source, false)?;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                capture_drops += reconnect_capture(&mut capture, &mut rx, &source, true)?;
+            }
         }
     }
 
@@ -345,7 +393,9 @@ fn run_live(args: LiveArgs) -> Result<()> {
 
     drop(mt_tx);
     let _ = done_rx.recv_timeout(Duration::from_secs(30));
-    engine.metrics_mut().add_drops(capture.drops());
+    engine
+        .metrics_mut()
+        .add_drops(capture_drops + capture.drops());
     drop(capture);
 
     eprintln!("ASR metrics: {}", engine.metrics());
@@ -354,6 +404,162 @@ fn run_live(args: LiveArgs) -> Result<()> {
         Ok(Ok(e2e)) => eprintln!("utterance-end to subtitle: {e2e}"),
         Ok(Err(err)) => tracing::error!(%err, "translation thread failed"),
         Err(_) => tracing::error!("translation thread panicked"),
+    }
+    Ok(())
+}
+
+fn run_summary(args: SummaryArgs) -> Result<()> {
+    let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
+    let mut engine = AsrEngine::new(&asr_paths, args.threads, args.rule2)?;
+    if !args.no_vad {
+        match SpeechGate::from_path(&args.vad_model) {
+            Ok(vad) => engine.set_vad(vad),
+            Err(err) => tracing::warn!(
+                %err,
+                "Silero VAD unavailable; music will leak into the summary"
+            ),
+        }
+    }
+    let whisper = if args.no_whisper {
+        None
+    } else {
+        match WhisperRescorer::from_dir(&args.whisper_dir, args.threads) {
+            Ok(rescorer) => Some(rescorer),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "Whisper rescorer unavailable; summary stays on the Zipformer text"
+                );
+                None
+            }
+        }
+    };
+    let mut translator = OnnxMarianTranslator::from_dir(&args.mt_model_dir)?;
+    let mut session = SummarySession::new();
+    let mut shown: Vec<String> = Vec::new();
+
+    if let Some(wav) = &args.wav {
+        let audio = load_wav_mono_f32(wav)?;
+        tracing::info!(
+            path = %wav.display(),
+            sample_rate = audio.sample_rate,
+            samples = audio.samples.len(),
+            "loaded wav for summary"
+        );
+        for chunk in chunk_samples(&audio.samples, audio.sample_rate, CHUNK_MS) {
+            note_events(
+                &mut session,
+                &mut translator,
+                &whisper,
+                &mut shown,
+                engine.push_samples(audio.sample_rate, &chunk)?,
+            )?;
+        }
+        note_events(
+            &mut session,
+            &mut translator,
+            &whisper,
+            &mut shown,
+            engine.finish_input()?,
+        )?;
+    } else {
+        let running = install_ctrlc()?;
+        let source = CaptureSource::Microphone;
+        let (mut capture, mut rx) = start_capture(source.clone(), AUDIO_QUEUE_CAPACITY)?;
+        println!("Summarizing microphone. Press Ctrl+C to stop.");
+        let mut buffer = Vec::new();
+        let mut sample_rate = 0_u32;
+        while running.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => {
+                    sample_rate = chunk.sample_rate;
+                    buffer.extend_from_slice(&chunk.samples);
+                    let chunk_len = samples_for_ms(sample_rate, CHUNK_MS).max(1);
+                    while buffer.len() >= chunk_len {
+                        let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
+                        note_events(
+                            &mut session,
+                            &mut translator,
+                            &whisper,
+                            &mut shown,
+                            engine.push_samples(sample_rate, &samples)?,
+                        )?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    let _ = reconnect_capture(&mut capture, &mut rx, &source, false)?;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = reconnect_capture(&mut capture, &mut rx, &source, true)?;
+                }
+            }
+        }
+        if sample_rate > 0 && !buffer.is_empty() {
+            note_events(
+                &mut session,
+                &mut translator,
+                &whisper,
+                &mut shown,
+                engine.push_samples(sample_rate, &buffer)?,
+            )?;
+        }
+        note_events(
+            &mut session,
+            &mut translator,
+            &whisper,
+            &mut shown,
+            engine.finish_input()?,
+        )?;
+        drop(capture);
+    }
+
+    if shown.is_empty() {
+        println!("要約できる発話がまだありません。");
+    }
+    Ok(())
+}
+
+fn note_events(
+    session: &mut SummarySession,
+    translator: &mut OnnxMarianTranslator,
+    whisper: &Option<WhisperRescorer>,
+    shown: &mut Vec<String>,
+    events: Vec<AsrEvent>,
+) -> Result<()> {
+    for event in events {
+        let AsrEvent::Final(utterance) = event else {
+            continue;
+        };
+        let english = rescore_english(
+            whisper,
+            &TranslationJob {
+                zipformer: utterance.text,
+                samples: utterance.samples,
+                sample_rate: utterance.sample_rate,
+                utterance_ended: Instant::now(),
+            },
+        )?;
+        if !session.push(&english) {
+            continue;
+        }
+        let points = session.points().to_vec();
+        if points == *shown {
+            continue;
+        }
+        println!("要約");
+        for point in &points {
+            match translator.translate(point) {
+                Ok(japanese) => {
+                    if let Some(japanese) = text::keep_japanese(&japanese) {
+                        println!("- {japanese}");
+                    }
+                }
+                Err(err) => tracing::warn!(%err, %point, "summary point failed"),
+            }
+        }
+        println!();
+        let _ = io::stdout().flush();
+        *shown = points;
     }
     Ok(())
 }
@@ -391,6 +597,34 @@ fn selected_capture_source(loopback: bool, app: Option<&str>) -> CaptureSource {
         CaptureSource::Application(app.to_string())
     } else {
         CaptureSource::Microphone
+    }
+}
+
+fn reconnect_capture(
+    capture: &mut AudioCapture,
+    rx: &mut Receiver<AudioChunk>,
+    source: &CaptureSource,
+    force: bool,
+) -> Result<u64> {
+    if !force && !capture.is_invalidated() {
+        return Ok(0);
+    }
+    println!("Audio stream dropped (device sample rate or route changed). Reconnecting...");
+    let _ = io::stdout().flush();
+    let drops = capture.drops();
+    std::thread::sleep(Duration::from_millis(400));
+    match start_capture(source.clone(), AUDIO_QUEUE_CAPACITY) {
+        Ok((next, next_rx)) => {
+            *capture = next;
+            *rx = next_rx;
+            println!("Capture reconnected.");
+            let _ = io::stdout().flush();
+            Ok(drops)
+        }
+        Err(err) => {
+            tracing::warn!(%err, "capture reconnect failed");
+            Ok(0)
+        }
     }
 }
 

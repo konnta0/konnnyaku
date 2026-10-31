@@ -1,11 +1,11 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig};
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use cpal::{Device, ErrorKind, SampleFormat, Stream, StreamConfig};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use hound::{SampleFormat as WavSampleFormat, WavReader};
 
 #[cfg(target_os = "macos")]
@@ -47,12 +47,18 @@ pub struct AudioCapture {
     #[cfg(target_os = "macos")]
     _tap: Option<macos_tap::ProcessTap>,
     drops: Arc<AtomicU64>,
+    invalidated: Arc<AtomicBool>,
 }
 
 impl AudioCapture {
     /// Number of chunks dropped because the bounded queue was full.
     pub fn drops(&self) -> u64 {
         self.drops.load(Ordering::Relaxed)
+    }
+
+    /// True when Core Audio invalidated the stream (sample-rate change, device swap).
+    pub fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::SeqCst)
     }
 }
 
@@ -186,6 +192,7 @@ fn open_capture_stream(
 
     let (tx, rx) = bounded::<AudioChunk>(queue_capacity);
     let drops = Arc::new(AtomicU64::new(0));
+    let invalidated = Arc::new(AtomicBool::new(false));
     let stream = build_input_stream(
         &device,
         config,
@@ -194,6 +201,7 @@ fn open_capture_stream(
         sample_rate,
         tx,
         Arc::clone(&drops),
+        Arc::clone(&invalidated),
     )?;
     stream.play().context(play_context)?;
 
@@ -203,6 +211,7 @@ fn open_capture_stream(
             #[cfg(target_os = "macos")]
             _tap: tap,
             drops,
+            invalidated,
         },
         rx,
     ))
@@ -281,68 +290,99 @@ fn build_input_stream(
     sample_rate: u32,
     tx: Sender<AudioChunk>,
     drops: Arc<AtomicU64>,
+    invalidated: Arc<AtomicBool>,
 ) -> Result<Stream> {
     let stream = match sample_format {
-        SampleFormat::F32 => device.build_input_stream(
-            config,
-            move |data: &[f32], _| {
-                send_mono_chunk(
-                    &tx,
-                    &drops,
-                    sample_rate,
-                    frames_to_mono(data, channels, |s| s),
-                );
-            },
-            log_stream_error,
-            None,
-        )?,
-        SampleFormat::I16 => device.build_input_stream(
-            config,
-            move |data: &[i16], _| {
-                send_mono_chunk(
-                    &tx,
-                    &drops,
-                    sample_rate,
-                    frames_to_mono(data, channels, |s| f32::from(s) / 32768.0),
-                );
-            },
-            log_stream_error,
-            None,
-        )?,
-        SampleFormat::U16 => device.build_input_stream(
-            config,
-            move |data: &[u16], _| {
-                send_mono_chunk(
-                    &tx,
-                    &drops,
-                    sample_rate,
-                    frames_to_mono(data, channels, |s| (f32::from(s) - 32768.0) / 32768.0),
-                );
-            },
-            log_stream_error,
-            None,
-        )?,
-        SampleFormat::I32 => device.build_input_stream(
-            config,
-            move |data: &[i32], _| {
-                send_mono_chunk(
-                    &tx,
-                    &drops,
-                    sample_rate,
-                    frames_to_mono(data, channels, |s| s as f32 / 2_147_483_648.0),
-                );
-            },
-            log_stream_error,
-            None,
-        )?,
+        SampleFormat::F32 => {
+            let on_error = {
+                let invalidated = Arc::clone(&invalidated);
+                move |err: cpal::Error| mark_stream_error(&invalidated, err)
+            };
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _| {
+                    send_mono_chunk(
+                        &tx,
+                        &drops,
+                        sample_rate,
+                        frames_to_mono(data, channels, |s| s),
+                    );
+                },
+                on_error,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            let on_error = {
+                let invalidated = Arc::clone(&invalidated);
+                move |err: cpal::Error| mark_stream_error(&invalidated, err)
+            };
+            device.build_input_stream(
+                config,
+                move |data: &[i16], _| {
+                    send_mono_chunk(
+                        &tx,
+                        &drops,
+                        sample_rate,
+                        frames_to_mono(data, channels, |s| f32::from(s) / 32768.0),
+                    );
+                },
+                on_error,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            let on_error = {
+                let invalidated = Arc::clone(&invalidated);
+                move |err: cpal::Error| mark_stream_error(&invalidated, err)
+            };
+            device.build_input_stream(
+                config,
+                move |data: &[u16], _| {
+                    send_mono_chunk(
+                        &tx,
+                        &drops,
+                        sample_rate,
+                        frames_to_mono(data, channels, |s| (f32::from(s) - 32768.0) / 32768.0),
+                    );
+                },
+                on_error,
+                None,
+            )?
+        }
+        SampleFormat::I32 => {
+            let on_error = {
+                let invalidated = Arc::clone(&invalidated);
+                move |err: cpal::Error| mark_stream_error(&invalidated, err)
+            };
+            device.build_input_stream(
+                config,
+                move |data: &[i32], _| {
+                    send_mono_chunk(
+                        &tx,
+                        &drops,
+                        sample_rate,
+                        frames_to_mono(data, channels, |s| s as f32 / 2_147_483_648.0),
+                    );
+                },
+                on_error,
+                None,
+            )?
+        }
         other => anyhow::bail!("unsupported sample format: {other:?}"),
     };
 
     Ok(stream)
 }
 
-fn log_stream_error(err: cpal::Error) {
+fn mark_stream_error(invalidated: &AtomicBool, err: cpal::Error) {
     tracing::error!(?err, "audio stream error");
+    match err.kind() {
+        ErrorKind::StreamInvalidated | ErrorKind::DeviceChanged | ErrorKind::DeviceNotAvailable => {
+            invalidated.store(true, Ordering::SeqCst);
+        }
+        _ => {}
+    }
 }
 
 fn send_mono_chunk(

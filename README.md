@@ -58,11 +58,19 @@ cargo run --release -- live --app "Google Chrome"
 
 # Live captions from system output (all apps)
 cargo run --release -- live --loopback
+
+# Summarize the default microphone (not playback)
+cargo run --release -- summary
+
+# Summarize a WAV file
+cargo run --release -- summary --wav models/asr/zipformer-en/test_wavs/0.wav
 ```
 
 Endpoint trailing silence defaults to 0.8 s (`--rule2`). Lower it for faster subtitles, raise it to avoid cutting mid-sentence.
 
 Live finals are VAD-gated, then Whisper-rescored, then translated. `--no-vad` and `--no-whisper` fall back toward the Zipformer-only path. Songs and heavy BGM still confuse ASR; skip those finals instead of emitting `ははは…` / `<unk>`.
+
+`summary` listens to the microphone, or to a WAV file with `--wav`. It does not tap app or system output. After enough distinct speech, it prints up to three Japanese points and replaces that list when the points change. The list is the recent transcript with repeats removed, then translated. It is not a separate abstractive model.
 
 `--app` and `--loopback` are macOS-only. `--app` records that application (including helpers/renderers and every tab). `--loopback` records every application on the default output. Keep Built-in Speakers as the output device for `--loopback`: USB interfaces and headsets that also have a microphone are rejected, because cpal would open their physical input instead of a tap.
 
@@ -84,6 +92,7 @@ src/asr.rs           sherpa-onnx OnlineRecognizer (beam search + utterance PCM)
 src/vad.rs           Silero VAD music gate
 src/whisper.rs       offline Whisper tiny.en rescorer
 src/text.rs          junk English / Japanese filters
+src/summary.rs       microphone transcript reduced to a few points
 src/translation.rs   Translator + OnnxMarianTranslator
 src/metrics.rs       RTF and translation percentiles
 models/              gitignored weights
