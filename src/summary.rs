@@ -1,15 +1,23 @@
 use crate::text;
 
-const POINT_LIMIT: usize = 3;
+const SECTION_LIMIT: usize = 5;
 const MAX_LINES: usize = 80;
 const MIN_CONTENT_WORDS: usize = 12;
 const DUPLICATE_JACCARD: f32 = 0.55;
 
-/// English lines heard from the microphone, reduced to a few points.
+/// English record of one meeting. Japanese is filled in by the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeetingDraft {
+    pub transcript: Vec<String>,
+    pub topics: Vec<String>,
+    pub decisions: Vec<String>,
+    pub actions: Vec<String>,
+}
+
+/// Lines heard so far, split into a meeting note.
 #[derive(Debug, Default)]
 pub struct SummarySession {
     lines: Vec<String>,
-    points: Vec<String>,
 }
 
 impl SummarySession {
@@ -17,7 +25,7 @@ impl SummarySession {
         Self::default()
     }
 
-    /// Record one finalized utterance. Returns true when the points changed.
+    /// Record one finalized utterance. Returns true when the transcript grew.
     pub fn push(&mut self, raw: &str) -> bool {
         let Some(clean) = text::prepare_english(raw) else {
             return false;
@@ -30,52 +38,119 @@ impl SummarySession {
             let extra = self.lines.len() - MAX_LINES;
             self.lines.drain(0..extra);
         }
-        let next = select_points(&self.lines);
-        if next == self.points {
-            return false;
-        }
-        self.points = next;
-        !self.points.is_empty()
+        true
     }
 
-    pub fn points(&self) -> &[String] {
-        &self.points
+    pub fn draft(&self) -> MeetingDraft {
+        let mut transcript = Vec::new();
+        let mut topics = Vec::new();
+        let mut decisions = Vec::new();
+        let mut actions = Vec::new();
+        for line in &self.lines {
+            if transcript
+                .iter()
+                .any(|prev: &String| jaccard(prev, line) >= DUPLICATE_JACCARD)
+            {
+                continue;
+            }
+            transcript.push(line.clone());
+            if content_words(std::iter::once(line.as_str()))
+                .next()
+                .is_none()
+            {
+                continue;
+            }
+            match classify(line) {
+                LineKind::Decision => decisions.push(line.clone()),
+                LineKind::Action => actions.push(line.clone()),
+                LineKind::Topic => topics.push(line.clone()),
+            }
+        }
+        if content_words(transcript.iter().map(String::as_str)).count() < MIN_CONTENT_WORDS {
+            topics.clear();
+            decisions.clear();
+            actions.clear();
+        } else {
+            topics = cap_section(topics);
+            decisions = cap_section(decisions);
+            actions = cap_section(actions);
+        }
+        MeetingDraft {
+            transcript,
+            topics,
+            decisions,
+            actions,
+        }
     }
 }
 
-fn select_points(lines: &[String]) -> Vec<String> {
-    let mut kept: Vec<&str> = Vec::new();
-    for line in lines {
-        if kept
-            .iter()
-            .any(|prev| jaccard(prev, line) >= DUPLICATE_JACCARD)
-        {
-            continue;
-        }
-        kept.push(line.as_str());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineKind {
+    Topic,
+    Decision,
+    Action,
+}
+
+fn classify(line: &str) -> LineKind {
+    let lower = line.to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &[
+            "we decided",
+            "decision is",
+            "we agree",
+            "we agreed",
+            "let's go with",
+            "lets go with",
+            "approved",
+        ],
+    ) {
+        return LineKind::Decision;
     }
-    kept.retain(|line| content_words(std::iter::once(*line)).next().is_some());
-    if content_words(kept.iter().copied()).count() < MIN_CONTENT_WORDS {
-        return Vec::new();
+    if contains_any(
+        &lower,
+        &[
+            "let's ",
+            "lets ",
+            "we need to",
+            "we should",
+            "i will",
+            "i'll",
+            "please ",
+            "follow up",
+            "action item",
+            "next step",
+            "we will",
+        ],
+    ) {
+        return LineKind::Action;
     }
-    if kept.len() <= POINT_LIMIT {
-        return kept.into_iter().map(str::to_string).collect();
+    LineKind::Topic
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn cap_section(lines: Vec<String>) -> Vec<String> {
+    if lines.len() <= SECTION_LIMIT {
+        return lines;
     }
-    let mut ranked: Vec<(usize, usize)> = kept
+    let mut ranked: Vec<(usize, usize)> = lines
         .iter()
         .enumerate()
-        .map(|(index, line)| (index, content_words(std::iter::once(*line)).count()))
+        .map(|(index, line)| (index, content_words(std::iter::once(line.as_str())).count()))
         .collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
     let mut chosen: Vec<usize> = ranked
         .into_iter()
-        .take(POINT_LIMIT)
+        .take(SECTION_LIMIT)
         .map(|(index, _)| index)
         .collect();
     chosen.sort_unstable();
     chosen
         .into_iter()
-        .map(|index| kept[index].to_string())
+        .map(|index| lines[index].clone())
         .collect()
 }
 
@@ -150,34 +225,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_or_repeated_speech_has_no_summary() {
+    fn short_speech_keeps_a_transcript_without_sections() {
         let mut session = SummarySession::new();
         assert!(!session.push("yeah"));
-        assert!(session.points().is_empty());
-        assert!(!session.push("update the server"));
-        assert!(session.points().is_empty());
-        assert!(!session.push("update the server"));
-        assert!(session.points().is_empty());
+        assert!(session.push("update the server"));
+        let draft = session.draft();
+        assert_eq!(draft.transcript, vec!["update the server".to_string()]);
+        assert!(draft.topics.is_empty());
+        assert!(draft.decisions.is_empty());
+        assert!(draft.actions.is_empty());
     }
 
     #[test]
-    fn keeps_distinct_points_in_time_order() {
+    fn splits_actions_decisions_and_topics() {
         let mut session = SummarySession::new();
-        assert!(
-            !session.push("We need to update the server before Friday and ship the patch tonight")
-        );
-        assert!(
-            !session.push("We need to update the server before Friday and ship the patch tonight")
-        );
-        assert!(session
-            .push("The migration copies the user table and the audit log into the new cluster"));
-        assert!(!session.push("yeah yeah"));
-        assert!(session
-            .push("After that we tell support the window is Thursday night not Friday morning"));
+        session.push("We need to update the server before Friday and ship the patch tonight");
+        session.push("We need to update the server before Friday and ship the patch tonight");
+        session.push("The migration copies the user table and the audit log into the new cluster");
+        session.push("yeah yeah");
+        session.push("We decided to keep the old API until the migration finishes next month");
+        session.push("After that we tell support the window is Thursday night not Friday morning");
+        let draft = session.draft();
         assert_eq!(
-            session.points(),
-            &[
-                "We need to update the server before Friday and ship the patch tonight",
+            draft.actions,
+            vec!["We need to update the server before Friday and ship the patch tonight"]
+        );
+        assert_eq!(
+            draft.decisions,
+            vec!["We decided to keep the old API until the migration finishes next month"]
+        );
+        assert_eq!(
+            draft.topics,
+            vec![
                 "The migration copies the user table and the audit log into the new cluster",
                 "After that we tell support the window is Thursday night not Friday morning",
             ]
@@ -185,14 +264,14 @@ mod tests {
     }
 
     #[test]
-    fn drops_a_near_duplicate_and_keeps_a_later_topic() {
+    fn drops_a_near_duplicate_action() {
         let mut session = SummarySession::new();
         session.push("We need to update the server before Friday and ship the patch tonight");
         session.push("We need to update the server before Friday and ship the patch");
         session.push("The migration copies the user table and the audit log into the new cluster");
-        let points = session.points();
-        assert_eq!(points.len(), 2);
-        assert!(points[0].contains("update the server"));
-        assert!(points[1].contains("migration"));
+        let draft = session.draft();
+        assert_eq!(draft.actions.len(), 1);
+        assert_eq!(draft.topics.len(), 1);
+        assert!(draft.topics[0].contains("migration"));
     }
 }

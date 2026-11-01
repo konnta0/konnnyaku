@@ -1,34 +1,29 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineWhisperModelConfig};
+use sherpa_onnx::{
+    OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
+    OfflineWhisperModelConfig,
+};
 
-/// Offline Whisper used to rescore Zipformer finals before translation.
+/// Offline English model that rescores Zipformer finals before translation.
 pub struct WhisperRescorer {
     recognizer: OfflineRecognizer,
 }
 
 impl WhisperRescorer {
-    /// Load a sherpa-onnx Whisper directory (tiny.en by default).
+    /// Load a sherpa-onnx Whisper directory, or a Parakeet directory that contains a joiner.
     pub fn from_dir(model_dir: &Path, num_threads: i32) -> Result<Self> {
-        let encoder = find_file(
-            model_dir,
-            &[
-                "tiny.en-encoder.int8.onnx",
-                "tiny.en-encoder.onnx",
-                "encoder.int8.onnx",
-            ],
-        )?;
-        let decoder = find_file(
-            model_dir,
-            &[
-                "tiny.en-decoder.int8.onnx",
-                "tiny.en-decoder.onnx",
-                "decoder.int8.onnx",
-            ],
-        )?;
-        let tokens = find_file(model_dir, &["tiny.en-tokens.txt", "tokens.txt"])?;
+        if find_onnx(model_dir, "joiner").is_ok() {
+            return Self::parakeet(model_dir, num_threads);
+        }
+        Self::whisper(model_dir, num_threads)
+    }
 
+    fn whisper(model_dir: &Path, num_threads: i32) -> Result<Self> {
+        let encoder = find_onnx(model_dir, "encoder")?;
+        let decoder = find_onnx(model_dir, "decoder")?;
+        let tokens = find_tokens(model_dir)?;
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.whisper = OfflineWhisperModelConfig {
             encoder: Some(path_string(&encoder)),
@@ -44,10 +39,31 @@ impl WhisperRescorer {
         config.model_config.num_threads = num_threads.max(1);
         config.model_config.debug = false;
         config.model_config.model_type = Some("whisper".to_string());
-
         let recognizer = OfflineRecognizer::create(&config)
             .ok_or_else(|| anyhow!("failed to create Whisper OfflineRecognizer"))?;
         tracing::info!(dir = %model_dir.display(), "loaded Whisper rescorer");
+        Ok(Self { recognizer })
+    }
+
+    fn parakeet(model_dir: &Path, num_threads: i32) -> Result<Self> {
+        let encoder = find_onnx(model_dir, "encoder")?;
+        let decoder = find_onnx(model_dir, "decoder")?;
+        let joiner = find_onnx(model_dir, "joiner")?;
+        let tokens = find_tokens(model_dir)?;
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.transducer = OfflineTransducerModelConfig {
+            encoder: Some(path_string(&encoder)),
+            decoder: Some(path_string(&decoder)),
+            joiner: Some(path_string(&joiner)),
+        };
+        config.model_config.tokens = Some(path_string(&tokens));
+        config.model_config.provider = Some("cpu".to_string());
+        config.model_config.num_threads = num_threads.max(1);
+        config.model_config.debug = false;
+        config.model_config.model_type = Some("nemo_transducer".to_string());
+        let recognizer = OfflineRecognizer::create(&config)
+            .ok_or_else(|| anyhow!("failed to create Parakeet OfflineRecognizer"))?;
+        tracing::info!(dir = %model_dir.display(), "loaded Parakeet rescorer");
         Ok(Self { recognizer })
     }
 
@@ -70,17 +86,56 @@ impl WhisperRescorer {
     }
 }
 
-fn find_file(dir: &Path, names: &[&str]) -> Result<PathBuf> {
-    for name in names {
-        let path = dir.join(name);
-        if path.is_file() {
-            return Ok(path);
+fn find_onnx(dir: &Path, role: &str) -> Result<PathBuf> {
+    let mut int8 = None;
+    let mut full = None;
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    let dashed = format!("-{role}.");
+    let bare = format!("{role}.");
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".onnx") {
+            continue;
+        }
+        if !name.contains(&dashed) && !name.starts_with(&bare) {
+            continue;
+        }
+        if name.contains(".int8.onnx") {
+            int8 = Some(entry.path());
+        } else if full.is_none() {
+            full = Some(entry.path());
         }
     }
-    Err(anyhow!(
-        "missing Whisper files in {}. Run scripts/download-asr.sh",
-        dir.display()
-    ))
+    int8.or(full).ok_or_else(|| {
+        anyhow!(
+            "missing {role} onnx in {}. Run scripts/download-asr.sh",
+            dir.display()
+        )
+    })
+}
+
+fn find_tokens(dir: &Path) -> Result<PathBuf> {
+    let mut preferred = None;
+    let mut plain = None;
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "tokens.txt" {
+            plain = Some(entry.path());
+        } else if name.ends_with("-tokens.txt") {
+            preferred = Some(entry.path());
+        }
+    }
+    preferred.or(plain).ok_or_else(|| {
+        anyhow!(
+            "missing tokens.txt in {}. Run scripts/download-asr.sh",
+            dir.display()
+        )
+    })
 }
 
 fn path_string(path: &Path) -> String {
@@ -91,6 +146,23 @@ fn path_string(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::time::Instant;
+
+    fn transcribe_wav(model_dir: &Path, wav: &Path) -> String {
+        let audio = crate::audio::load_wav_mono_f32(wav).expect("wav");
+        let rescorer = WhisperRescorer::from_dir(model_dir, 2).expect("load rescorer");
+        let started = Instant::now();
+        let text = rescorer
+            .transcribe(audio.sample_rate, &audio.samples)
+            .expect("transcribe")
+            .expect("non-empty");
+        eprintln!(
+            "{} {} ms: {text}",
+            model_dir.display(),
+            started.elapsed().as_millis()
+        );
+        text
+    }
 
     #[test]
     fn transcribes_bundled_tiny_en_wav() {
@@ -98,13 +170,7 @@ mod tests {
         if !dir.join("tiny.en-encoder.int8.onnx").is_file() {
             return;
         }
-        let audio = crate::audio::load_wav_mono_f32(&dir.join("test_wavs/0.wav"))
-            .expect("whisper test wav");
-        let rescorer = WhisperRescorer::from_dir(dir, 1).expect("load whisper");
-        let text = rescorer
-            .transcribe(audio.sample_rate, &audio.samples)
-            .expect("transcribe")
-            .expect("non-empty");
+        let text = transcribe_wav(dir, &dir.join("test_wavs/0.wav"));
         let upper = text.to_ascii_uppercase();
         assert!(
             upper.contains("NIGHTFALL") || upper.contains("YELLOW"),
