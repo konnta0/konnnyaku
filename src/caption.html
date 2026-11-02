@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="dark" />
+    <style>
+      :root {
+        --ink: rgba(255, 255, 255, 0.94);
+        --ink-soft: rgba(255, 255, 255, 0.62);
+        --ink-faint: rgba(255, 255, 255, 0.42);
+        --pill: rgba(255, 255, 255, 0.1);
+        --pill-ink: rgba(255, 255, 255, 0.78);
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      html,
+      body {
+        height: 100%;
+        background: transparent;
+        color: var(--ink);
+        font-family: -apple-system, "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+        overflow: hidden;
+      }
+
+      .card {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        padding: 16px 18px 18px;
+        border-radius: 20px;
+        background: linear-gradient(
+          180deg,
+          rgba(22, 26, 34, 0.9) 0%,
+          rgba(10, 12, 18, 0.86) 100%
+        );
+        box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.2);
+      }
+
+      .titlebar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        cursor: grab;
+        margin-bottom: 14px;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      .title {
+        font-size: 17px;
+        font-weight: 650;
+        letter-spacing: -0.02em;
+      }
+
+      .spacer {
+        flex: 1;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 26px;
+        padding: 0 10px 0 8px;
+        border-radius: 999px;
+        background: var(--pill);
+        color: var(--pill-ink);
+        font-size: 12.5px;
+        font-weight: 500;
+      }
+
+      .pill svg {
+        width: 13px;
+        height: 13px;
+        opacity: 0.85;
+      }
+
+      .clear,
+      .close {
+        border: 0;
+        cursor: pointer;
+      }
+
+      .clear {
+        height: 26px;
+        padding: 0 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.14);
+        color: var(--ink);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .clear:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+
+      .close {
+        width: 22px;
+        height: 22px;
+        background: transparent;
+        color: var(--ink-faint);
+        font-size: 18px;
+        line-height: 1;
+        border-radius: 6px;
+      }
+
+      .close:hover {
+        color: var(--ink);
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .log {
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+      }
+
+      .placeholder {
+        color: var(--ink-faint);
+        font-size: 15px;
+        line-height: 1.55;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 28px;
+        padding: 2px 0 8px;
+      }
+
+      .row.single {
+        grid-template-columns: 1fr;
+      }
+
+      .col {
+        min-width: 0;
+        font-size: 15px;
+        line-height: 1.55;
+        letter-spacing: -0.011em;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .col.en {
+        color: var(--ink-soft);
+      }
+
+      .row.preview .col {
+        opacity: 0.72;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <header class="titlebar" id="titlebar">
+        <div class="title">文字起こし</div>
+        <div class="spacer"></div>
+        <div class="pill" aria-label="Japanese">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.3" />
+            <ellipse cx="8" cy="8" rx="2.4" ry="6.2" fill="none" stroke="currentColor" stroke-width="1.2" />
+            <path d="M2 8h12M3.2 5h9.6M3.2 11h9.6" fill="none" stroke="currentColor" stroke-width="1.1" />
+          </svg>
+          Japanese
+        </div>
+        <button class="clear" id="clear" type="button" disabled>クリア</button>
+        <button class="close" id="close" type="button" aria-label="閉じる">×</button>
+      </header>
+      <div class="log" id="log">
+        <div class="placeholder" id="placeholder">聞き取り中…</div>
+      </div>
+    </div>
+    <script>
+      var log = document.getElementById("log");
+      var placeholder = document.getElementById("placeholder");
+      var clearButton = document.getElementById("clear");
+      var follow = true;
+      var settled = Object.create(null);
+      var rows = Object.create(null);
+
+      function nearBottom() {
+        return log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+      }
+
+      function stickToBottom() {
+        if (follow || nearBottom()) {
+          log.scrollTop = log.scrollHeight;
+        }
+      }
+
+      function refreshChrome() {
+        var hasRow = log.querySelector(".row") !== null;
+        placeholder.hidden = hasRow;
+        clearButton.disabled = !hasRow;
+      }
+
+      log.addEventListener("scroll", function () {
+        follow = nearBottom();
+      });
+
+      document.getElementById("close").addEventListener("click", function () {
+        window.ipc.postMessage("close");
+      });
+
+      clearButton.addEventListener("click", function () {
+        log.querySelectorAll(".row").forEach(function (row) {
+          settled[row.dataset.rev] = true;
+          delete rows[row.dataset.rev];
+          row.remove();
+        });
+        follow = true;
+        refreshChrome();
+      });
+
+      document.getElementById("titlebar").addEventListener("mousedown", function (event) {
+        if (event.button !== 0 || event.target.closest("button")) {
+          return;
+        }
+        window.ipc.postMessage("drag");
+      });
+
+      function has(pair, key) {
+        return Object.prototype.hasOwnProperty.call(pair, key);
+      }
+
+      function ensureShape(row, single) {
+        var layout = single ? "single" : "split";
+        if (row.dataset.layout === layout) {
+          return;
+        }
+        row.dataset.layout = layout;
+        row.classList.toggle("single", single);
+        row.replaceChildren();
+        if (single) {
+          var text = document.createElement("div");
+          text.className = "col";
+          text.dataset.role = "text";
+          row.append(text);
+          return;
+        }
+        var en = document.createElement("div");
+        en.className = "col en";
+        en.dataset.role = "en";
+        var ja = document.createElement("div");
+        ja.className = "col ja";
+        ja.dataset.role = "ja";
+        row.append(en, ja);
+      }
+
+      function writeRole(row, role, value) {
+        var node = row.querySelector('[data-role="' + role + '"]');
+        if (node) {
+          node.textContent = value;
+        }
+      }
+
+      function place(row) {
+        var rev = Number(row.dataset.rev);
+        var rows = log.querySelectorAll(".row");
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i] !== row && Number(rows[i].dataset.rev) > rev) {
+            log.insertBefore(row, rows[i]);
+            return;
+          }
+        }
+        log.append(row);
+      }
+
+      function rowFor(rev) {
+        var key = String(rev);
+        if (rows[key]) {
+          return rows[key];
+        }
+        var row = document.createElement("div");
+        row.className = "row preview";
+        row.dataset.rev = key;
+        rows[key] = row;
+        place(row);
+        return row;
+      }
+
+      function paint(row, pair, live) {
+        var single = has(pair, "single") ? !!pair.single : row.dataset.layout === "single";
+        ensureShape(row, single);
+        if (single) {
+          if (has(pair, "japanese") || has(pair, "english")) {
+            writeRole(row, "text", pair.japanese || pair.english || "");
+          }
+        } else {
+          if (has(pair, "english")) {
+            writeRole(row, "en", pair.english || "");
+          }
+          if (has(pair, "japanese")) {
+            writeRole(row, "ja", pair.japanese || "");
+          }
+        }
+        row.classList.toggle("preview", live);
+      }
+
+      window.konnnyakuUpdate = function (pair) {
+        if (!pair || pair.rev === undefined || pair.rev === null) {
+          return;
+        }
+        var rev = String(pair.rev);
+        if (pair.kind === "drop") {
+          settled[rev] = true;
+          var dropped = rows[rev];
+          if (dropped && dropped.classList.contains("preview")) {
+            dropped.remove();
+            delete rows[rev];
+          }
+          refreshChrome();
+          return;
+        }
+        if (settled[rev]) {
+          return;
+        }
+        var row = rowFor(rev);
+        if (pair.kind === "commit") {
+          settled[rev] = true;
+          paint(row, pair, false);
+        } else {
+          if (!row.classList.contains("preview") && settled[rev]) {
+            return;
+          }
+          paint(row, pair, true);
+        }
+        refreshChrome();
+        stickToBottom();
+      };
+    </script>
+  </body>
+</html>

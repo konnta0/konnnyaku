@@ -7,7 +7,7 @@ Fully local English speech → Japanese subtitle PoC for Apple Silicon.
 - Translation: Marian-MT (`staka/fugumt-en-ja`) via ONNX Runtime.
   `Helsinki-NLP/opus-mt-en-jap` is too weak on technical speech.
   `facebook/nllb-200-distilled-600M` was slower on this machine (about 0.5–3 s a sentence) and missed technical terms FuguMT keeps, such as pull request and memory dump.
-- UI: `live` prints line-by-line captions in the terminal. `summary` opens a separate meeting-note window on macOS.
+- UI: on macOS, `live` opens the transcription window. `summary` stays in the terminal and writes `meetings/latest.json`. `--cli` keeps live captions in the terminal.
 - Inference does not use the network after models are downloaded.
 - Browser / YouTube: `--app "Google Chrome"` taps that app's output (all tabs). `--loopback` taps every app on the default output. Speech and interviews work better than songs.
 
@@ -52,16 +52,12 @@ cargo run --release -- translate --text "We need to update the server."
 # Batch-translate finalized utterances
 cargo run --release -- translate --file benches/technical_en.txt
 
-# Live captions from the microphone
+# Live translation window (macOS). `--cli` prints in the terminal instead.
 cargo run --release -- live --mic
-
-# Live captions from one app
 cargo run --release -- live --app "Google Chrome"
+cargo run --release -- live --cli --mic
 
-# Live captions from system output (all apps)
-cargo run --release -- live --loopback
-
-# Meeting note from the microphone, a WAV file, or one app
+# Meeting note in the terminal. Writes meetings/latest.json while it listens.
 cargo run --release -- summary
 cargo run --release -- summary --app "Google Chrome"
 cargo run --release -- summary --wav models/asr/zipformer-en/test_wavs/0.wav
@@ -72,7 +68,7 @@ Endpoint trailing silence defaults to 0.8 s (`--rule2`). Lower it for faster sub
 
 Live finals are VAD-gated, then rescored, then translated. The default rescorer is Whisper tiny.en. `--whisper-dir` also accepts Whisper distil-small.en or Parakeet TDT 0.6B (`models/asr/parakeet-en`); on the bundled clip they heard the same sentence and did not fix FuguMT. `--no-vad` and `--no-whisper` fall back toward the Zipformer-only path. Songs and heavy BGM still confuse ASR; those finals are skipped instead of emitting `ははは…` / `<unk>`.
 
-`summary` on macOS opens a meeting-note window. It records English and, when you press 要約する, writes `meetings/latest.json` and shows 概要, 議題, 決定, and 次のアクション. `--cli`, `--json`, and `--wav` write that note without a click. Each item keeps both `english` and `japanese`. Another process can read the file. Decisions and actions are lines that say so (`we decided`, `we need to`, `let's`). This is not a separate abstractive model. `live` still translates playback line by line and does not write this note. Japanese speech summarized without translation is not in this build.
+`live` on macOS opens one transcription window. English stays on the left and Japanese on the right, without a line between sentences. The open sentence updates in place while Zipformer is still guessing, including a Japanese preview, and the finished Whisper line replaces that same sentence. Lines stay until クリア or the window closes. If you have scrolled up, new text does not pull you back to the bottom. A same-language transcript uses one column; this build is still English to Japanese, so the two columns remain. `summary` has no window. It records speech in the terminal and writes `meetings/latest.json` as lines arrive. `--json` prints that note on stdout as well. Each item keeps both `english` and `japanese`. Another process can read the file. Decisions and actions are lines that say so (`we decided`, `we need to`, `let's`). This is not a separate abstractive model. Japanese speech summarized without translation is not in this build.
 
 `--app` and `--loopback` are macOS-only. `--app` records that application (including helpers/renderers and every tab). `--loopback` records every application on the default output. Keep Built-in Speakers as the output device for `--loopback`: USB interfaces and headsets that also have a microphone are rejected, because cpal would open their physical input instead of a tap.
 

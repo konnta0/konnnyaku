@@ -12,8 +12,8 @@ mod whisper;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -111,6 +111,9 @@ struct LiveArgs {
     /// Capture one application's output (name or bundle ID, macOS).
     #[arg(long)]
     app: Option<String>,
+    /// Keep captions in the terminal. On macOS the default is a floating window.
+    #[arg(long, default_value_t = false)]
+    cli: bool,
     /// Directory containing encoder/decoder/joiner/tokens.
     #[arg(long, default_value = DEFAULT_ASR_DIR)]
     asr_model_dir: PathBuf,
@@ -154,7 +157,7 @@ struct SummaryArgs {
     /// Print the meeting note as JSON on stdout. The file is written either way.
     #[arg(long, default_value_t = false)]
     json: bool,
-    /// Keep the note in the terminal. On macOS the default is a floating window.
+    /// Accepted so older commands still parse. Summary always stays in the terminal.
     #[arg(long, default_value_t = false)]
     cli: bool,
     /// Directory containing encoder/decoder/joiner/tokens.
@@ -188,6 +191,8 @@ struct TranslationJob {
     samples: Vec<f32>,
     sample_rate: u32,
     utterance_ended: Instant,
+    /// Caption row this final closes. Partials of the next utterance use a newer id.
+    generation: u64,
 }
 
 fn main() -> Result<()> {
@@ -322,6 +327,40 @@ fn run_translate(args: TranslateArgs) -> Result<()> {
 }
 
 fn run_live(args: LiveArgs) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if !args.cli {
+        return run_live_hud(args);
+    }
+    run_live_session(args, None, None)
+}
+
+#[cfg(target_os = "macos")]
+fn run_live_hud(args: LiveArgs) -> Result<()> {
+    let running = install_ctrlc()?;
+    let (tx, rx) = bounded::<String>(32);
+    let capture_running = Arc::clone(&running);
+    let join = std::thread::Builder::new()
+        .name("konnnyaku-live".into())
+        .spawn(move || {
+            let result = run_live_session(args, Some(Arc::clone(&capture_running)), Some(tx));
+            capture_running.store(false, Ordering::SeqCst);
+            result
+        })
+        .context("spawn live thread")?;
+    let ui = crate::overlay::run_caption_hud(Arc::clone(&running), rx);
+    running.store(false, Ordering::SeqCst);
+    let capture_result = join
+        .join()
+        .map_err(|_| anyhow::anyhow!("live thread panicked"))?;
+    ui?;
+    capture_result
+}
+
+fn run_live_session(
+    args: LiveArgs,
+    running: Option<Arc<AtomicBool>>,
+    captions: Option<Sender<String>>,
+) -> Result<()> {
     let source = live_capture_source(&args)?;
     let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
     let mut engine = AsrEngine::new(&asr_paths, args.threads, args.rule2)?;
@@ -350,21 +389,66 @@ fn run_live(args: LiveArgs) -> Result<()> {
     };
     let mut translator = OnnxMarianTranslator::from_dir(&args.mt_model_dir)?;
 
-    let running = install_ctrlc()?;
+    let running = match running {
+        Some(running) => running,
+        None => install_ctrlc()?,
+    };
+    let show_terminal = captions.is_none();
     let label = capture_label(&source);
     let (mut capture, mut rx) = start_capture(source.clone(), AUDIO_QUEUE_CAPACITY)?;
     let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
     let (done_tx, done_rx) = bounded::<()>(1);
+    let (caption_feed, caption_worker) = match captions.clone() {
+        Some(ui) => {
+            let (kick_tx, kick_rx) = bounded::<()>(1);
+            let tail = Arc::new(CaptionTail::new());
+            (
+                Some(CaptionFeed {
+                    ui: ui.clone(),
+                    tail: Arc::clone(&tail),
+                    kick: kick_tx,
+                }),
+                Some((ui, tail, kick_rx)),
+            )
+        }
+        None => (None, None),
+    };
 
     let mt_thread = std::thread::spawn(move || -> Result<TranslationMetrics> {
         let mut e2e = TranslationMetrics::new()?;
-        while let Ok(job) = mt_rx.recv() {
-            match caption_final(&whisper, &mut translator, job) {
-                Ok(Some(metrics_elapsed)) => {
-                    e2e.record(metrics_elapsed);
+        if let Some((ui, tail, kick_rx)) = caption_worker {
+            let mut translated = TailTranslation::default();
+            loop {
+                select! {
+                    recv(mt_rx) -> job => {
+                        match job {
+                            Ok(job) => {
+                                record_caption(&mut e2e, &whisper, &mut translator, job, Some(&ui));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    recv(kick_rx) -> msg => {
+                        if msg.is_ok() {
+                            translate_tail(&tail, &mut translator, &ui, &mut translated);
+                        } else {
+                            while let Ok(job) = mt_rx.recv() {
+                                record_caption(
+                                    &mut e2e,
+                                    &whisper,
+                                    &mut translator,
+                                    job,
+                                    Some(&ui),
+                                );
+                            }
+                            break;
+                        }
+                    }
                 }
-                Ok(None) => {}
-                Err(err) => tracing::error!(%err, "caption failed"),
+            }
+        } else {
+            while let Ok(job) = mt_rx.recv() {
+                record_caption(&mut e2e, &whisper, &mut translator, job, None);
             }
         }
         let _ = done_tx.send(());
@@ -377,9 +461,13 @@ fn run_live(args: LiveArgs) -> Result<()> {
     let mut translation_queue_drops = 0_u64;
     let mut capture_drops = 0_u64;
 
-    println!(
-        "Live EN->JA from {label}. Partials are Zipformer; finals are VAD-gated, Whisper-rescored, then translated. Press Ctrl+C to stop."
-    );
+    if show_terminal {
+        println!(
+            "Live EN->JA from {label}. Partials are Zipformer; finals are VAD-gated, Whisper-rescored, then translated. Press Ctrl+C to stop."
+        );
+    } else {
+        eprintln!("Translation from {label}. Close the window or press Ctrl+C to stop.");
+    }
     while running.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
@@ -389,7 +477,8 @@ fn run_live(args: LiveArgs) -> Result<()> {
                 while buffer.len() >= chunk_len {
                     let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
                     let events = engine.push_samples(sample_rate, &samples)?;
-                    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
+                    translation_queue_drops +=
+                        enqueue_finals(&mt_tx, events, &mut display, caption_feed.as_ref());
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -403,12 +492,14 @@ fn run_live(args: LiveArgs) -> Result<()> {
 
     if sample_rate > 0 && !buffer.is_empty() {
         let events = engine.push_samples(sample_rate, &buffer)?;
-        translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
+        translation_queue_drops +=
+            enqueue_finals(&mt_tx, events, &mut display, caption_feed.as_ref());
     }
     let events = engine.finish_input()?;
-    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display);
+    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, caption_feed.as_ref());
     display.finish();
 
+    drop(caption_feed);
     drop(mt_tx);
     let _ = done_rx.recv_timeout(Duration::from_secs(30));
     engine
@@ -427,50 +518,11 @@ fn run_live(args: LiveArgs) -> Result<()> {
 }
 
 fn run_summary(args: SummaryArgs) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    if args.wav.is_none() && !args.cli {
-        return run_summary_hud(args);
-    }
-    run_summary_capture(args, None)
+    let _ = args.cli;
+    run_summary_capture(args)
 }
 
-#[cfg(target_os = "macos")]
-fn run_summary_hud(args: SummaryArgs) -> Result<()> {
-    let running = install_ctrlc()?;
-    let (tx, rx) = bounded::<String>(8);
-    let (summarize_tx, summarize_rx) = bounded::<()>(1);
-    let capture_running = Arc::clone(&running);
-    let join = std::thread::Builder::new()
-        .name("konnnyaku-summary".into())
-        .spawn(move || {
-            let result = run_summary_capture(
-                args,
-                Some(MeetingWindow {
-                    running: Arc::clone(&capture_running),
-                    notes: tx,
-                    summarize: summarize_rx,
-                }),
-            );
-            capture_running.store(false, Ordering::SeqCst);
-            result
-        })
-        .context("spawn summary thread")?;
-    let ui = crate::overlay::run_meeting_hud(Arc::clone(&running), rx, summarize_tx);
-    running.store(false, Ordering::SeqCst);
-    let capture_result = join
-        .join()
-        .map_err(|_| anyhow::anyhow!("summary thread panicked"))?;
-    ui?;
-    capture_result
-}
-
-struct MeetingWindow {
-    running: Arc<AtomicBool>,
-    notes: Sender<String>,
-    summarize: Receiver<()>,
-}
-
-fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<()> {
+fn run_summary_capture(args: SummaryArgs) -> Result<()> {
     let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
     let mut engine = AsrEngine::new(&asr_paths, args.threads, args.rule2)?;
     if !args.no_vad {
@@ -517,7 +569,6 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
             note_events(
                 &source_label,
                 args.json,
-                None,
                 &mut session,
                 &mut translator,
                 &whisper,
@@ -528,7 +579,6 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
         note_events(
             &source_label,
             args.json,
-            None,
             &mut session,
             &mut translator,
             &whisper,
@@ -538,23 +588,14 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
     } else {
         let source = summary_capture_source(&args)?;
         source_label = capture_label(&source);
-        let running = match &hud {
-            Some(window) => Arc::clone(&window.running),
-            None => install_ctrlc()?,
-        };
+        let running = install_ctrlc()?;
         let (mut capture, mut rx) = start_capture(source.clone(), AUDIO_QUEUE_CAPACITY)?;
-        if hud.is_some() {
-            eprintln!(
-                "Meeting note from {source_label}. Press 要約する in the window, or close it to stop."
-            );
-        } else {
-            eprintln!("Meeting note from {source_label}. Press Ctrl+C to stop.");
-        }
+        eprintln!("Meeting note from {source_label}. Press Ctrl+C to stop.");
         let mut buffer = Vec::new();
         let mut sample_rate = 0_u32;
         while running.load(Ordering::SeqCst) {
-            match wait_capture(&rx, hud.as_ref().map(|window| &window.summarize)) {
-                CaptureWait::Chunk(chunk) => {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => {
                     sample_rate = chunk.sample_rate;
                     buffer.extend_from_slice(&chunk.samples);
                     let chunk_len = samples_for_ms(sample_rate, CHUNK_MS).max(1);
@@ -563,7 +604,6 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
                         note_events(
                             &source_label,
                             args.json,
-                            hud.as_ref(),
                             &mut session,
                             &mut translator,
                             &whisper,
@@ -572,25 +612,10 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
                         )?;
                     }
                 }
-                CaptureWait::Summarize => {
-                    if let Err(err) = publish_note(
-                        &source_label,
-                        args.json,
-                        hud.as_ref().map(|window| &window.notes),
-                        &session.draft(),
-                        &mut translator,
-                        &mut cache,
-                    ) {
-                        tracing::error!(%err, "meeting summary failed");
-                        if let Some(window) = hud.as_ref() {
-                            send_summary_error(&window.notes, &session.draft());
-                        }
-                    }
-                }
-                CaptureWait::Timeout => {
+                Err(RecvTimeoutError::Timeout) => {
                     let _ = reconnect_capture(&mut capture, &mut rx, &source, false)?;
                 }
-                CaptureWait::Disconnected => {
+                Err(RecvTimeoutError::Disconnected) => {
                     let _ = reconnect_capture(&mut capture, &mut rx, &source, true)?;
                 }
             }
@@ -599,7 +624,6 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
             note_events(
                 &source_label,
                 args.json,
-                hud.as_ref(),
                 &mut session,
                 &mut translator,
                 &whisper,
@@ -610,7 +634,6 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
         note_events(
             &source_label,
             args.json,
-            hud.as_ref(),
             &mut session,
             &mut translator,
             &whisper,
@@ -623,44 +646,11 @@ fn run_summary_capture(args: SummaryArgs, hud: Option<MeetingWindow>) -> Result<
     if cache.wrote_sections.is_none() {
         if cache.wrote_file {
             println!("文字起こしだけを meetings/latest.json に書きました。");
-        } else if !session.draft().transcript.is_empty() {
-            println!("要約ボタンが押されなかったので meetings/latest.json は更新していません。");
         } else {
             println!("会議メモにできる発話がまだありません。");
         }
     }
     Ok(())
-}
-
-enum CaptureWait {
-    Chunk(AudioChunk),
-    Summarize,
-    Timeout,
-    Disconnected,
-}
-
-fn wait_capture(audio: &Receiver<AudioChunk>, summarize: Option<&Receiver<()>>) -> CaptureWait {
-    let Some(summarize) = summarize else {
-        return match audio.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => CaptureWait::Chunk(chunk),
-            Err(RecvTimeoutError::Timeout) => CaptureWait::Timeout,
-            Err(RecvTimeoutError::Disconnected) => CaptureWait::Disconnected,
-        };
-    };
-    select! {
-        recv(audio) -> msg => match msg {
-            Ok(chunk) => CaptureWait::Chunk(chunk),
-            Err(_) => CaptureWait::Disconnected,
-        },
-        recv(summarize) -> msg => {
-            if msg.is_ok() {
-                CaptureWait::Summarize
-            } else {
-                CaptureWait::Disconnected
-            }
-        }
-        default(Duration::from_millis(100)) => CaptureWait::Timeout,
-    }
 }
 
 #[derive(Default)]
@@ -682,7 +672,6 @@ fn summary_capture_source(args: &SummaryArgs) -> Result<CaptureSource> {
 fn note_events(
     source: &str,
     json: bool,
-    hud: Option<&MeetingWindow>,
     session: &mut SummarySession,
     translator: &mut OnnxMarianTranslator,
     whisper: &Option<WhisperRescorer>,
@@ -701,6 +690,7 @@ fn note_events(
                 samples: utterance.samples,
                 sample_rate: utterance.sample_rate,
                 utterance_ended: Instant::now(),
+                generation: 0,
             },
         )?;
         changed |= session.push(&english);
@@ -708,17 +698,12 @@ fn note_events(
     if !changed {
         return Ok(());
     }
-    if let Some(window) = hud {
-        send_hearing(&window.notes, &session.draft().transcript);
-        return Ok(());
-    }
-    publish_note(source, json, None, &session.draft(), translator, cache)
+    publish_note(source, json, &session.draft(), translator, cache)
 }
 
 fn publish_note(
     source: &str,
     json: bool,
-    hud: Option<&Sender<String>>,
     draft: &MeetingDraft,
     translator: &mut OnnxMarianTranslator,
     cache: &mut NoteCache,
@@ -752,25 +737,7 @@ fn publish_note(
         draft.actions.clone(),
     );
     let sections_changed = cache.wrote_sections.as_ref() != Some(&sections);
-    if let Some(tx) = hud {
-        let view = HudNote {
-            kind: "note",
-            lines: &note.transcript,
-            overview: &note.overview,
-            topics: &note.topics,
-            decisions: &note.decisions,
-            actions: &note.actions,
-            error: None,
-        };
-        match hud_json(&view) {
-            Ok(payload) => {
-                if tx.send_timeout(payload, Duration::from_secs(2)).is_err() {
-                    tracing::debug!("meeting window missed the summary");
-                }
-            }
-            Err(err) => tracing::warn!(%err, "meeting note json failed"),
-        }
-    } else if json {
+    if json {
         println!("{}", serde_json::to_string(&note)?);
         let _ = io::stdout().flush();
     } else if sections_changed && note.has_sections() {
@@ -866,48 +833,6 @@ struct MeetingItem {
     japanese: String,
 }
 
-#[derive(serde::Serialize)]
-struct HudNote<'a> {
-    kind: &'static str,
-    lines: &'a [String],
-    overview: &'a str,
-    topics: &'a [MeetingItem],
-    decisions: &'a [MeetingItem],
-    actions: &'a [MeetingItem],
-    error: Option<&'a str>,
-}
-
-#[derive(serde::Serialize)]
-struct HudHearing<'a> {
-    kind: &'static str,
-    lines: &'a [String],
-}
-
-fn send_hearing(tx: &Sender<String>, lines: &[String]) {
-    let view = HudHearing {
-        kind: "hearing",
-        lines,
-    };
-    if let Ok(payload) = hud_json(&view) {
-        let _ = tx.try_send(payload);
-    }
-}
-
-fn send_summary_error(tx: &Sender<String>, draft: &MeetingDraft) {
-    let view = HudNote {
-        kind: "note",
-        lines: &draft.transcript,
-        overview: "",
-        topics: &[],
-        decisions: &[],
-        actions: &[],
-        error: Some("要約に失敗しました"),
-    };
-    if let Ok(payload) = hud_json(&view) {
-        let _ = tx.send_timeout(payload, Duration::from_secs(2));
-    }
-}
-
 fn hud_json(value: &impl serde::Serialize) -> Result<String> {
     let json = serde_json::to_string(value)?;
     Ok(json
@@ -987,25 +912,111 @@ fn capture_label(source: &CaptureSource) -> String {
     }
 }
 
+struct CaptionTail {
+    rev: AtomicU64,
+    text: Mutex<String>,
+}
+
+impl CaptionTail {
+    fn new() -> Self {
+        Self {
+            rev: AtomicU64::new(0),
+            text: Mutex::new(String::new()),
+        }
+    }
+
+    fn publish(&self, text: String) -> u64 {
+        if let Ok(mut slot) = self.text.lock() {
+            *slot = text;
+        }
+        self.rev.load(Ordering::Acquire)
+    }
+
+    fn close_utterance(&self) -> u64 {
+        let closed = self.rev.fetch_add(1, Ordering::Release);
+        if let Ok(mut slot) = self.text.lock() {
+            slot.clear();
+        }
+        closed
+    }
+
+    fn snapshot(&self) -> (u64, String) {
+        let rev = self.rev.load(Ordering::Acquire);
+        let text = self
+            .text
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
+        (rev, text)
+    }
+}
+
+struct CaptionFeed {
+    ui: Sender<String>,
+    tail: Arc<CaptionTail>,
+    kick: Sender<()>,
+}
+
 fn enqueue_finals(
     tx: &crossbeam_channel::Sender<TranslationJob>,
     events: Vec<AsrEvent>,
     display: &mut TranscriptDisplay,
+    feed: Option<&CaptionFeed>,
 ) -> u64 {
     let mut drops = 0;
     for event in events {
         match event {
-            AsrEvent::Partial(text) => display.partial(text),
+            AsrEvent::Partial(text) => {
+                if let Some(feed) = feed {
+                    let rev = feed.tail.publish(text.clone());
+                    send_caption(
+                        &feed.ui,
+                        &serde_json::json!({
+                            "kind": "preview",
+                            "rev": rev,
+                            "english": text,
+                            "single": false,
+                        }),
+                        false,
+                    );
+                    let _ = feed.kick.try_send(());
+                } else {
+                    display.partial(text);
+                }
+            }
             AsrEvent::Final(utterance) => {
-                display.clear_partial();
-                match tx.try_send(TranslationJob {
+                let generation = if let Some(feed) = feed {
+                    feed.tail.close_utterance()
+                } else {
+                    display.clear_partial();
+                    0
+                };
+                let job = TranslationJob {
                     zipformer: utterance.text,
                     samples: utterance.samples,
                     sample_rate: utterance.sample_rate,
                     utterance_ended: Instant::now(),
-                }) {
-                    Ok(()) => {}
-                    Err(_) => drops += 1,
+                    generation,
+                };
+                if let Err(err) = tx.try_send(job) {
+                    drops += 1;
+                    if let Some(feed) = feed {
+                        let job = match err {
+                            crossbeam_channel::TrySendError::Full(job)
+                            | crossbeam_channel::TrySendError::Disconnected(job) => job,
+                        };
+                        send_caption(
+                            &feed.ui,
+                            &serde_json::json!({
+                                "kind": "commit",
+                                "rev": job.generation,
+                                "english": job.zipformer,
+                                "japanese": "",
+                                "single": false,
+                            }),
+                            true,
+                        );
+                    }
                 }
             }
         }
@@ -1013,29 +1024,150 @@ fn enqueue_finals(
     drops
 }
 
+fn record_caption(
+    metrics: &mut TranslationMetrics,
+    whisper: &Option<WhisperRescorer>,
+    translator: &mut OnnxMarianTranslator,
+    job: TranslationJob,
+    captions: Option<&Sender<String>>,
+) {
+    match caption_final(whisper, translator, job, captions) {
+        Ok(Some(elapsed)) => metrics.record(elapsed),
+        Ok(None) => {}
+        Err(err) => tracing::error!(%err, "caption failed"),
+    }
+}
+
+#[derive(Default)]
+struct TailTranslation {
+    rev: u64,
+    text: String,
+    japanese: String,
+}
+
+fn translate_tail(
+    tail: &CaptionTail,
+    translator: &mut OnnxMarianTranslator,
+    captions: &Sender<String>,
+    translated: &mut TailTranslation,
+) {
+    loop {
+        let (rev, text) = tail.snapshot();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            *translated = TailTranslation::default();
+            return;
+        }
+        if text == translated.text {
+            if rev != translated.rev && !translated.japanese.is_empty() {
+                send_caption(
+                    captions,
+                    &serde_json::json!({
+                        "kind": "preview",
+                        "rev": rev,
+                        "japanese": translated.japanese,
+                        "single": false,
+                    }),
+                    false,
+                );
+                translated.rev = rev;
+            }
+            return;
+        }
+        let japanese = match translator.translate(&text) {
+            Ok(japanese) => text::keep_japanese(&japanese).unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(%err, "live caption translation failed");
+                return;
+            }
+        };
+        let (now, current) = tail.snapshot();
+        if now != rev || current.trim() != text {
+            continue;
+        }
+        translated.rev = rev;
+        translated.text = text;
+        translated.japanese = japanese;
+        if translated.japanese.is_empty() {
+            return;
+        }
+        send_caption(
+            captions,
+            &serde_json::json!({
+                "kind": "preview",
+                "rev": rev,
+                "japanese": translated.japanese,
+                "single": false,
+            }),
+            false,
+        );
+        return;
+    }
+}
+
 fn caption_final(
     whisper: &Option<WhisperRescorer>,
     translator: &mut OnnxMarianTranslator,
     job: TranslationJob,
+    captions: Option<&Sender<String>>,
 ) -> Result<Option<Duration>> {
     let english = rescore_english(whisper, &job)?;
     let Some(english) = text::prepare_english(&english) else {
         tracing::debug!(zipformer = %job.zipformer, "skipped junk English");
+        if let Some(tx) = captions {
+            send_caption(
+                tx,
+                &serde_json::json!({
+                    "kind": "drop",
+                    "rev": job.generation,
+                }),
+                true,
+            );
+        }
         return Ok(None);
     };
 
-    println!("EN: {english}");
-    let _ = io::stdout().flush();
-
     let japanese = translator.translate(&english)?;
     let elapsed = job.utterance_ended.elapsed();
-    if let Some(japanese) = text::keep_japanese(&japanese) {
-        println!("JA: {japanese}");
-        let _ = io::stdout().flush();
+    let japanese = text::keep_japanese(&japanese).unwrap_or_default();
+    if let Some(tx) = captions {
+        send_caption(
+            tx,
+            &serde_json::json!({
+                "kind": "commit",
+                "rev": job.generation,
+                "english": english,
+                "japanese": japanese,
+                "single": false,
+            }),
+            true,
+        );
     } else {
-        tracing::debug!(%english, "skipped junk Japanese");
+        println!("EN: {english}");
+        if !japanese.is_empty() {
+            println!("JA: {japanese}");
+        } else {
+            tracing::debug!(%english, "skipped junk Japanese");
+        }
+        let _ = io::stdout().flush();
     }
     Ok(Some(elapsed))
+}
+
+fn send_caption(tx: &Sender<String>, value: &impl serde::Serialize, reliable: bool) {
+    match hud_json(value) {
+        Ok(payload) => {
+            let sent = if reliable {
+                tx.send_timeout(payload, Duration::from_millis(500)).is_ok()
+            } else {
+                tx.try_send(payload).is_ok()
+            };
+            if !sent {
+                tracing::debug!("caption window missed an update");
+            }
+        }
+        Err(err) => tracing::warn!(%err, "caption json failed"),
+    }
 }
 
 fn rescore_english(whisper: &Option<WhisperRescorer>, job: &TranslationJob) -> Result<String> {
