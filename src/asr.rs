@@ -87,6 +87,8 @@ pub struct AsrEngine {
     utterance: Vec<f32>,
     utterance_rate: u32,
     vad: Option<SpeechGate>,
+    /// When set, a VAD end still yields the buffered PCM if Zipformer has no text.
+    retain_audio_finals: bool,
 }
 
 impl AsrEngine {
@@ -124,7 +126,23 @@ impl AsrEngine {
             utterance: Vec::new(),
             utterance_rate: 0,
             vad: None,
+            retain_audio_finals: false,
         })
+    }
+
+    /// Keep speech audio on a VAD end even when the streaming recognizer is silent.
+    pub fn set_retain_audio_finals(&mut self, retain: bool) {
+        self.retain_audio_finals = retain;
+    }
+
+    /// Samples buffered for the open utterance.
+    pub fn utterance_len(&self) -> usize {
+        self.utterance.len()
+    }
+
+    /// Copy of the open utterance. Empty when nothing is buffered.
+    pub fn snapshot_utterance(&self) -> (u32, Vec<f32>) {
+        (self.utterance_rate, self.utterance.clone())
     }
 
     /// Gate Zipformer with Silero so music is not decoded as English.
@@ -196,7 +214,7 @@ impl AsrEngine {
 
     fn finalize_utterance(&mut self) -> Vec<AsrEvent> {
         let mut events = self.poll();
-        if !self.last_text.is_empty() {
+        if self.should_emit_final() {
             events.push(self.take_final());
             self.recognizer.reset(&self.stream);
             self.skip_repeat = true;
@@ -204,6 +222,10 @@ impl AsrEngine {
             self.utterance.clear();
         }
         events
+    }
+
+    fn should_emit_final(&self) -> bool {
+        !self.last_text.is_empty() || (self.retain_audio_finals && !self.utterance.is_empty())
     }
 
     fn take_final(&mut self) -> AsrEvent {
@@ -233,7 +255,7 @@ impl AsrEngine {
             }
 
             if self.recognizer.is_endpoint(&self.stream) {
-                if !self.last_text.is_empty() {
+                if self.should_emit_final() {
                     events.push(self.take_final());
                 } else {
                     self.utterance.clear();

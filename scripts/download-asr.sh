@@ -79,6 +79,28 @@ download_whisper() {
   echo "Whisper tiny.en ready at ${target}"
 }
 
+download_haas() {
+  local target="${DEST}/haas-ja"
+  local encoder="${target}/encoder.quantized.onnx"
+  local weights="${target}/encoder.data"
+  local base="https://huggingface.co/oboroge0/Haas-ja-v1.0-onnx-quantized/resolve/main"
+
+  if [[ -f "${encoder}" && -f "${weights}" && -f "${target}/decoder.onnx" && -f "${target}/joiner.onnx" && -f "${target}/tokens.txt" ]]; then
+    echo "Haas Japanese ONNX already present at ${target}"
+    return 0
+  fi
+
+  mkdir -p "${target}"
+  echo "Downloading Haas Japanese ONNX into ${target}"
+  curl -L --fail --retry 3 -o "${target}/tokens.txt" "${base}/tokens.txt"
+  curl -L --fail --retry 3 -o "${target}/decoder.onnx" "${base}/decoder.onnx"
+  curl -L --fail --retry 3 -o "${target}/joiner.onnx" "${base}/joiner.onnx"
+  curl -L --fail --retry 3 -o "${encoder}" "${base}/encoder.quantized.onnx"
+  curl -L --fail --retry 3 -C - -o "${weights}" "${base}/encoder.data"
+  echo "Haas Japanese ONNX ready at ${target}"
+}
+
 download_zipformer
 download_vad
 download_whisper
+download_haas

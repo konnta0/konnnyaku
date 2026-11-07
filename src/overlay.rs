@@ -17,7 +17,11 @@ enum UiEvent {
     Drag,
 }
 
-pub fn run_caption_hud(running: Arc<AtomicBool>, lines: Receiver<String>) -> Result<()> {
+pub fn run_caption_hud(
+    running: Arc<AtomicBool>,
+    lines: Receiver<String>,
+    langs: Arc<crate::LangPair>,
+) -> Result<()> {
     let mut event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let feed_proxy = proxy.clone();
@@ -54,6 +58,12 @@ pub fn run_caption_hud(running: Arc<AtomicBool>, lines: Receiver<String>) -> Res
 
     let close_flag = Arc::clone(&running);
     let drag_proxy = proxy;
+    let ipc_langs = Arc::clone(&langs);
+    let init = format!(
+        "window.konnnyakuPair && window.konnnyakuPair('{}','{}')",
+        langs.source().label(),
+        langs.target().label()
+    );
     let webview = WebViewBuilder::new()
         .with_transparent(true)
         .with_html(include_str!("caption.html"))
@@ -63,10 +73,17 @@ pub fn run_caption_hud(running: Arc<AtomicBool>, lines: Receiver<String>) -> Res
             "drag" => {
                 let _ = drag_proxy.send_event(UiEvent::Drag);
             }
+            "pair:en:en" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::En),
+            "pair:en:ja" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::Ja),
+            "pair:ja:ja" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::Ja),
+            "pair:ja:en" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::En),
             _ => {}
         })
         .build(&window)
         .context("create caption webview")?;
+    if let Err(err) = webview.evaluate_script(&init) {
+        tracing::debug!(%err, "caption language init failed");
+    }
 
     let loop_running = Arc::clone(&running);
     event_loop.run_return(move |event, _, control_flow| {

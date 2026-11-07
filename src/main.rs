@@ -1,5 +1,6 @@
 mod asr;
 mod audio;
+mod haas;
 mod metrics;
 #[cfg(target_os = "macos")]
 mod overlay;
@@ -12,7 +13,7 @@ mod whisper;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ use crate::audio::{
     AudioCapture, AudioChunk, CaptureSource, chunk_samples, list_tappable_apps, load_wav_mono_f32,
     samples_for_ms, start_capture,
 };
+use crate::haas::HaasRecognizer;
 use crate::metrics::TranslationMetrics;
 use crate::summary::{MeetingDraft, SummarySession};
 use crate::translation::{OnnxMarianTranslator, Translator};
@@ -114,6 +116,15 @@ struct LiveArgs {
     /// Keep captions in the terminal. On macOS the default is a floating window.
     #[arg(long, default_value_t = false)]
     cli: bool,
+    /// Spoken language. `en` or `ja`.
+    #[arg(long, default_value = "en")]
+    source: String,
+    /// Caption language. `en` or `ja`.
+    #[arg(long, default_value = "ja")]
+    target: String,
+    /// Haas Japanese ONNX directory.
+    #[arg(long, default_value = "models/asr/haas-ja")]
+    haas_dir: PathBuf,
     /// Directory containing encoder/decoder/joiner/tokens.
     #[arg(long, default_value = DEFAULT_ASR_DIR)]
     asr_model_dir: PathBuf,
@@ -327,27 +338,30 @@ fn run_translate(args: TranslateArgs) -> Result<()> {
 }
 
 fn run_live(args: LiveArgs) -> Result<()> {
+    let langs = Arc::new(LangPair::parse(&args.source, &args.target)?);
     #[cfg(target_os = "macos")]
     if !args.cli {
-        return run_live_hud(args);
+        return run_live_hud(args, langs);
     }
-    run_live_session(args, None, None)
+    run_live_session(args, None, None, langs)
 }
 
 #[cfg(target_os = "macos")]
-fn run_live_hud(args: LiveArgs) -> Result<()> {
+fn run_live_hud(args: LiveArgs, langs: Arc<LangPair>) -> Result<()> {
     let running = install_ctrlc()?;
     let (tx, rx) = bounded::<String>(32);
     let capture_running = Arc::clone(&running);
+    let ui_langs = Arc::clone(&langs);
     let join = std::thread::Builder::new()
         .name("konnnyaku-live".into())
         .spawn(move || {
-            let result = run_live_session(args, Some(Arc::clone(&capture_running)), Some(tx));
+            let result =
+                run_live_session(args, Some(Arc::clone(&capture_running)), Some(tx), langs);
             capture_running.store(false, Ordering::SeqCst);
             result
         })
         .context("spawn live thread")?;
-    let ui = crate::overlay::run_caption_hud(Arc::clone(&running), rx);
+    let ui = crate::overlay::run_caption_hud(Arc::clone(&running), rx, ui_langs);
     running.store(false, Ordering::SeqCst);
     let capture_result = join
         .join()
@@ -360,6 +374,7 @@ fn run_live_session(
     args: LiveArgs,
     running: Option<Arc<AtomicBool>>,
     captions: Option<Sender<String>>,
+    langs: Arc<LangPair>,
 ) -> Result<()> {
     let source = live_capture_source(&args)?;
     let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
@@ -398,57 +413,117 @@ fn run_live_session(
     let (mut capture, mut rx) = start_capture(source.clone(), AUDIO_QUEUE_CAPACITY)?;
     let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
     let (done_tx, done_rx) = bounded::<()>(1);
-    let (caption_feed, caption_worker) = match captions.clone() {
-        Some(ui) => {
-            let (kick_tx, kick_rx) = bounded::<()>(1);
-            let tail = Arc::new(CaptionTail::new());
-            (
-                Some(CaptionFeed {
-                    ui: ui.clone(),
-                    tail: Arc::clone(&tail),
-                    kick: kick_tx,
-                }),
-                Some((ui, tail, kick_rx)),
-            )
-        }
-        None => (None, None),
+    let tail = Arc::new(CaptionTail::new());
+    let ja_inbox = Arc::new(JaInbox::default());
+    let (ja_kick_tx, ja_kick_rx) = bounded::<()>(1);
+    let haas_dir = args.haas_dir.clone();
+    let haas_threads = args.threads;
+    let (en_kick_tx, en_kick_rx) = if captions.is_some() {
+        let (kick_tx, kick_rx) = bounded::<()>(1);
+        (Some(kick_tx), Some(kick_rx))
+    } else {
+        (None, None)
     };
+    let route = LiveRoute {
+        langs: Arc::clone(&langs),
+        ui: captions.clone(),
+        tail: Arc::clone(&tail),
+        en_kick: en_kick_tx,
+        ja_inbox: Arc::clone(&ja_inbox),
+        ja_kick: ja_kick_tx,
+    };
+    let worker_langs = Arc::clone(&langs);
+    let worker_ui = captions.clone();
+    let worker_tail = Arc::clone(&tail);
+    let worker_inbox = Arc::clone(&ja_inbox);
 
     let mt_thread = std::thread::spawn(move || -> Result<TranslationMetrics> {
         let mut e2e = TranslationMetrics::new()?;
-        if let Some((ui, tail, kick_rx)) = caption_worker {
-            let mut translated = TailTranslation::default();
+        let mut translated = TailTranslation::default();
+        let mut ja_model: Option<HaasRecognizer> = None;
+        let mut ja_failed = false;
+        if let Some(en_kick_rx) = en_kick_rx {
+            let ui = worker_ui.expect("caption sender");
             loop {
                 select! {
                     recv(mt_rx) -> job => {
                         match job {
-                            Ok(job) => {
-                                record_caption(&mut e2e, &whisper, &mut translator, job, Some(&ui));
-                            }
+                            Ok(job) => record_caption(
+                                &mut e2e,
+                                &whisper,
+                                &mut translator,
+                                job,
+                                Some(&ui),
+                                &worker_langs,
+                            ),
                             Err(_) => break,
                         }
                     }
-                    recv(kick_rx) -> msg => {
+                    recv(en_kick_rx) -> msg => {
                         if msg.is_ok() {
-                            translate_tail(&tail, &mut translator, &ui, &mut translated);
+                            translate_tail(
+                                &worker_tail,
+                                &mut translator,
+                                &ui,
+                                &mut translated,
+                                &worker_langs,
+                            );
                         } else {
-                            while let Ok(job) = mt_rx.recv() {
-                                record_caption(
-                                    &mut e2e,
-                                    &whisper,
-                                    &mut translator,
-                                    job,
-                                    Some(&ui),
-                                );
-                            }
+                            drain_english(&mut e2e, &whisper, &mut translator, &mt_rx, Some(&ui), &worker_langs);
+                            break;
+                        }
+                    }
+                    recv(ja_kick_rx) -> msg => {
+                        if msg.is_ok() {
+                            transcribe_japanese(
+                                &worker_inbox,
+                                &mut ja_model,
+                                &mut ja_failed,
+                                &haas_dir,
+                                haas_threads,
+                                Some(&ui),
+                                &worker_langs,
+                            );
+                        } else {
+                            drain_english(&mut e2e, &whisper, &mut translator, &mt_rx, Some(&ui), &worker_langs);
                             break;
                         }
                     }
                 }
             }
         } else {
-            while let Ok(job) = mt_rx.recv() {
-                record_caption(&mut e2e, &whisper, &mut translator, job, None);
+            loop {
+                select! {
+                    recv(mt_rx) -> job => {
+                        match job {
+                            Ok(job) => record_caption(
+                                &mut e2e,
+                                &whisper,
+                                &mut translator,
+                                job,
+                                None,
+                                &worker_langs,
+                            ),
+                            Err(_) => break,
+                        }
+                    }
+                    recv(ja_kick_rx) -> msg => {
+                        if msg.is_ok() {
+                            transcribe_japanese(
+                                &worker_inbox,
+                                &mut ja_model,
+                                &mut ja_failed,
+                                &haas_dir,
+                                haas_threads,
+                                worker_ui.as_ref(),
+                                &worker_langs,
+                            );
+                        } else {
+                            drain_english(&mut e2e, &whisper, &mut translator, &mt_rx, None, &worker_langs);
+                            break;
+                        }
+                    }
+                }
             }
         }
         let _ = done_tx.send(());
@@ -460,15 +535,20 @@ fn run_live_session(
     let mut sample_rate = 0_u32;
     let mut translation_queue_drops = 0_u64;
     let mut capture_drops = 0_u64;
+    let mut last_ja_preview = 0_usize;
 
     if show_terminal {
         println!(
-            "Live EN->JA from {label}. Partials are Zipformer; finals are VAD-gated, Whisper-rescored, then translated. Press Ctrl+C to stop."
+            "Live captions from {label}. Press Ctrl+C to stop. Source {}, target {}.",
+            langs.source().label(),
+            langs.target().label()
         );
     } else {
-        eprintln!("Translation from {label}. Close the window or press Ctrl+C to stop.");
+        eprintln!("Captions from {label}. Close the window or press Ctrl+C to stop.");
     }
     while running.load(Ordering::SeqCst) {
+        let hearing_japanese = langs.source() == CaptionLang::Ja;
+        engine.set_retain_audio_finals(hearing_japanese);
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
                 sample_rate = chunk.sample_rate;
@@ -477,8 +557,8 @@ fn run_live_session(
                 while buffer.len() >= chunk_len {
                     let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
                     let events = engine.push_samples(sample_rate, &samples)?;
-                    translation_queue_drops +=
-                        enqueue_finals(&mt_tx, events, &mut display, caption_feed.as_ref());
+                    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, &route);
+                    preview_japanese(&engine, &route, &mut last_ja_preview);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -492,14 +572,13 @@ fn run_live_session(
 
     if sample_rate > 0 && !buffer.is_empty() {
         let events = engine.push_samples(sample_rate, &buffer)?;
-        translation_queue_drops +=
-            enqueue_finals(&mt_tx, events, &mut display, caption_feed.as_ref());
+        translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, &route);
     }
     let events = engine.finish_input()?;
-    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, caption_feed.as_ref());
+    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, &route);
     display.finish();
 
-    drop(caption_feed);
+    drop(route);
     drop(mt_tx);
     let _ = done_rx.recv_timeout(Duration::from_secs(30));
     engine
@@ -912,6 +991,97 @@ fn capture_label(source: &CaptureSource) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptionLang {
+    En = 0,
+    Ja = 1,
+}
+
+impl CaptionLang {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "en" | "english" => Ok(Self::En),
+            "ja" | "japanese" => Ok(Self::Ja),
+            other => anyhow::bail!("language must be en or ja, got {other}"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ja => "ja",
+        }
+    }
+
+    fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(code: u8) -> Self {
+        if code == Self::Ja.code() {
+            Self::Ja
+        } else {
+            Self::En
+        }
+    }
+}
+
+struct LangPair {
+    source: AtomicU8,
+    target: AtomicU8,
+}
+
+impl LangPair {
+    fn parse(source: &str, target: &str) -> Result<Self> {
+        Ok(Self {
+            source: AtomicU8::new(CaptionLang::parse(source)?.code()),
+            target: AtomicU8::new(CaptionLang::parse(target)?.code()),
+        })
+    }
+
+    fn source(&self) -> CaptionLang {
+        CaptionLang::from_code(self.source.load(Ordering::Relaxed))
+    }
+
+    fn target(&self) -> CaptionLang {
+        CaptionLang::from_code(self.target.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, source: CaptionLang, target: CaptionLang) {
+        self.source.store(source.code(), Ordering::Relaxed);
+        self.target.store(target.code(), Ordering::Relaxed);
+    }
+
+    fn single(&self) -> bool {
+        self.source() == self.target()
+    }
+
+    fn translates(&self) -> bool {
+        self.source() == CaptionLang::En && self.target() == CaptionLang::Ja
+    }
+}
+
+struct JaClip {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    generation: u64,
+    commit: bool,
+}
+
+#[derive(Default)]
+struct JaInbox {
+    clip: Mutex<Option<JaClip>>,
+}
+
+struct LiveRoute {
+    langs: Arc<LangPair>,
+    ui: Option<Sender<String>>,
+    tail: Arc<CaptionTail>,
+    en_kick: Option<Sender<()>>,
+    ja_inbox: Arc<JaInbox>,
+    ja_kick: Sender<()>,
+}
+
 struct CaptionTail {
     rev: AtomicU64,
     text: Mutex<String>,
@@ -923,6 +1093,10 @@ impl CaptionTail {
             rev: AtomicU64::new(0),
             text: Mutex::new(String::new()),
         }
+    }
+
+    fn current(&self) -> u64 {
+        self.rev.load(Ordering::Acquire)
     }
 
     fn publish(&self, text: String) -> u64 {
@@ -951,46 +1125,88 @@ impl CaptionTail {
     }
 }
 
-struct CaptionFeed {
-    ui: Sender<String>,
-    tail: Arc<CaptionTail>,
-    kick: Sender<()>,
-}
-
 fn enqueue_finals(
     tx: &crossbeam_channel::Sender<TranslationJob>,
     events: Vec<AsrEvent>,
     display: &mut TranscriptDisplay,
-    feed: Option<&CaptionFeed>,
+    route: &LiveRoute,
 ) -> u64 {
     let mut drops = 0;
     for event in events {
         match event {
             AsrEvent::Partial(text) => {
-                if let Some(feed) = feed {
-                    let rev = feed.tail.publish(text.clone());
-                    send_caption(
-                        &feed.ui,
-                        &serde_json::json!({
-                            "kind": "preview",
-                            "rev": rev,
-                            "english": text,
-                            "single": false,
-                        }),
-                        false,
-                    );
-                    let _ = feed.kick.try_send(());
+                if route.langs.source() == CaptionLang::Ja {
+                    continue;
+                }
+                if let Some(ui) = &route.ui {
+                    let rev = route.tail.publish(text.clone());
+                    if route.langs.translates() {
+                        send_caption(
+                            ui,
+                            &serde_json::json!({
+                                "kind": "preview",
+                                "rev": rev,
+                                "english": text,
+                                "single": false,
+                            }),
+                            false,
+                        );
+                        if let Some(kick) = &route.en_kick {
+                            let _ = kick.try_send(());
+                        }
+                    } else {
+                        send_caption(
+                            ui,
+                            &serde_json::json!({
+                                "kind": "preview",
+                                "rev": rev,
+                                "single": true,
+                                "text": text,
+                            }),
+                            false,
+                        );
+                    }
                 } else {
                     display.partial(text);
                 }
             }
             AsrEvent::Final(utterance) => {
-                let generation = if let Some(feed) = feed {
-                    feed.tail.close_utterance()
+                if route.langs.source() == CaptionLang::Ja {
+                    let generation = route.tail.close_utterance();
+                    if utterance.samples.len() < utterance.sample_rate as usize / 2 {
+                        if let Some(ui) = &route.ui {
+                            send_caption(
+                                ui,
+                                &serde_json::json!({
+                                    "kind": "drop",
+                                    "rev": generation,
+                                }),
+                                true,
+                            );
+                        }
+                        continue;
+                    }
+                    offer_japanese(
+                        &route.ja_inbox,
+                        &route.ja_kick,
+                        JaClip {
+                            samples: utterance.samples,
+                            sample_rate: utterance.sample_rate,
+                            generation,
+                            commit: true,
+                        },
+                    );
+                    continue;
+                }
+                let generation = if route.ui.is_some() {
+                    route.tail.close_utterance()
                 } else {
                     display.clear_partial();
                     0
                 };
+                if utterance.text.trim().is_empty() {
+                    continue;
+                }
                 let job = TranslationJob {
                     zipformer: utterance.text,
                     samples: utterance.samples,
@@ -1000,20 +1216,17 @@ fn enqueue_finals(
                 };
                 if let Err(err) = tx.try_send(job) {
                     drops += 1;
-                    if let Some(feed) = feed {
+                    if let Some(ui) = &route.ui {
                         let job = match err {
                             crossbeam_channel::TrySendError::Full(job)
                             | crossbeam_channel::TrySendError::Disconnected(job) => job,
                         };
-                        send_caption(
-                            &feed.ui,
-                            &serde_json::json!({
-                                "kind": "commit",
-                                "rev": job.generation,
-                                "english": job.zipformer,
-                                "japanese": "",
-                                "single": false,
-                            }),
+                        send_heard(
+                            ui,
+                            "commit",
+                            job.generation,
+                            &job.zipformer,
+                            route.langs.single(),
                             true,
                         );
                     }
@@ -1024,14 +1237,63 @@ fn enqueue_finals(
     drops
 }
 
+fn preview_japanese(engine: &AsrEngine, route: &LiveRoute, last_len: &mut usize) {
+    if route.langs.source() != CaptionLang::Ja {
+        *last_len = 0;
+        return;
+    }
+    let len = engine.utterance_len();
+    if len == 0 {
+        *last_len = 0;
+        return;
+    }
+    let (sample_rate, samples) = engine.snapshot_utterance();
+    let step = sample_rate as usize;
+    if step == 0 || samples.len() < step || samples.len() < last_len.saturating_add(step) {
+        return;
+    }
+    *last_len = samples.len();
+    offer_japanese(
+        &route.ja_inbox,
+        &route.ja_kick,
+        JaClip {
+            samples,
+            sample_rate,
+            generation: route.tail.current(),
+            commit: false,
+        },
+    );
+}
+
+fn offer_japanese(inbox: &JaInbox, kick: &Sender<()>, clip: JaClip) {
+    if let Ok(mut slot) = inbox.clip.lock() {
+        *slot = Some(clip);
+    }
+    let _ = kick.try_send(());
+}
+
+fn drain_english(
+    metrics: &mut TranslationMetrics,
+    whisper: &Option<WhisperRescorer>,
+    translator: &mut OnnxMarianTranslator,
+    jobs: &crossbeam_channel::Receiver<TranslationJob>,
+    captions: Option<&Sender<String>>,
+    langs: &LangPair,
+) {
+    while let Ok(job) = jobs.recv() {
+        record_caption(metrics, whisper, translator, job, captions, langs);
+    }
+}
+
 fn record_caption(
     metrics: &mut TranslationMetrics,
     whisper: &Option<WhisperRescorer>,
     translator: &mut OnnxMarianTranslator,
     job: TranslationJob,
     captions: Option<&Sender<String>>,
+    langs: &LangPair,
 ) {
-    match caption_final(whisper, translator, job, captions) {
+    match caption_final(whisper, translator, job, captions, langs) {
         Ok(Some(elapsed)) => metrics.record(elapsed),
         Ok(None) => {}
         Err(err) => tracing::error!(%err, "caption failed"),
@@ -1050,8 +1312,12 @@ fn translate_tail(
     translator: &mut OnnxMarianTranslator,
     captions: &Sender<String>,
     translated: &mut TailTranslation,
+    langs: &LangPair,
 ) {
     loop {
+        if !langs.translates() {
+            return;
+        }
         let (rev, text) = tail.snapshot();
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -1088,7 +1354,7 @@ fn translate_tail(
         translated.rev = rev;
         translated.text = text;
         translated.japanese = japanese;
-        if translated.japanese.is_empty() {
+        if translated.japanese.is_empty() || !langs.translates() {
             return;
         }
         send_caption(
@@ -1105,11 +1371,137 @@ fn translate_tail(
     }
 }
 
+fn transcribe_japanese(
+    inbox: &JaInbox,
+    model: &mut Option<HaasRecognizer>,
+    failed: &mut bool,
+    model_dir: &std::path::Path,
+    threads: i32,
+    captions: Option<&Sender<String>>,
+    langs: &LangPair,
+) {
+    loop {
+        let Some(clip) = inbox.clip.lock().ok().and_then(|mut slot| slot.take()) else {
+            return;
+        };
+        if *failed {
+            continue;
+        }
+        if model.is_none() {
+            match HaasRecognizer::from_dir(model_dir, threads) {
+                Ok(recognizer) => *model = Some(recognizer),
+                Err(err) => {
+                    *failed = true;
+                    tracing::warn!(%err, "Haas Japanese recognizer unavailable");
+                    if let Some(tx) = captions {
+                        send_caption(
+                            tx,
+                            &serde_json::json!({
+                                "kind": "status",
+                                "message": "日本語の聞き取りモデルがありません。scripts/download-asr.sh を実行してください。",
+                            }),
+                            true,
+                        );
+                    }
+                    continue;
+                }
+            }
+        }
+        let Some(recognizer) = model.as_ref() else {
+            return;
+        };
+        let heard = match recognizer.transcribe(clip.sample_rate, &clip.samples) {
+            Ok(text) => text.and_then(|text| text::keep_japanese(&text)),
+            Err(err) => {
+                tracing::warn!(%err, "Haas transcription failed");
+                None
+            }
+        };
+        if inbox.clip.lock().ok().is_some_and(|slot| slot.is_some()) {
+            continue;
+        }
+        let Some(heard) = heard else {
+            if clip.commit {
+                if let Some(tx) = captions {
+                    send_caption(
+                        tx,
+                        &serde_json::json!({
+                            "kind": "drop",
+                            "rev": clip.generation,
+                        }),
+                        true,
+                    );
+                }
+            }
+            return;
+        };
+        let kind = if clip.commit { "commit" } else { "preview" };
+        if let Some(tx) = captions {
+            if langs.single() {
+                send_caption(
+                    tx,
+                    &serde_json::json!({
+                        "kind": kind,
+                        "rev": clip.generation,
+                        "single": true,
+                        "text": heard,
+                    }),
+                    clip.commit,
+                );
+            } else {
+                send_caption(
+                    tx,
+                    &serde_json::json!({
+                        "kind": kind,
+                        "rev": clip.generation,
+                        "single": false,
+                        "source": heard,
+                    }),
+                    clip.commit,
+                );
+            }
+        } else {
+            println!("{heard}");
+            let _ = io::stdout().flush();
+        }
+        if clip.commit {
+            return;
+        }
+    }
+}
+
+fn send_heard(tx: &Sender<String>, kind: &str, rev: u64, text: &str, single: bool, reliable: bool) {
+    if single {
+        send_caption(
+            tx,
+            &serde_json::json!({
+                "kind": kind,
+                "rev": rev,
+                "single": true,
+                "text": text,
+            }),
+            reliable,
+        );
+    } else {
+        send_caption(
+            tx,
+            &serde_json::json!({
+                "kind": kind,
+                "rev": rev,
+                "single": false,
+                "english": text,
+            }),
+            reliable,
+        );
+    }
+}
+
 fn caption_final(
     whisper: &Option<WhisperRescorer>,
     translator: &mut OnnxMarianTranslator,
     job: TranslationJob,
     captions: Option<&Sender<String>>,
+    langs: &LangPair,
 ) -> Result<Option<Duration>> {
     let english = rescore_english(whisper, &job)?;
     let Some(english) = text::prepare_english(&english) else {
@@ -1127,27 +1519,42 @@ fn caption_final(
         return Ok(None);
     };
 
-    let japanese = translator.translate(&english)?;
+    let japanese = if langs.translates() {
+        let japanese = translator.translate(&english)?;
+        text::keep_japanese(&japanese).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let elapsed = job.utterance_ended.elapsed();
-    let japanese = text::keep_japanese(&japanese).unwrap_or_default();
     if let Some(tx) = captions {
-        send_caption(
-            tx,
-            &serde_json::json!({
-                "kind": "commit",
-                "rev": job.generation,
-                "english": english,
-                "japanese": japanese,
-                "single": false,
-            }),
-            true,
-        );
+        if langs.single() {
+            send_caption(
+                tx,
+                &serde_json::json!({
+                    "kind": "commit",
+                    "rev": job.generation,
+                    "single": true,
+                    "text": english,
+                }),
+                true,
+            );
+        } else {
+            send_caption(
+                tx,
+                &serde_json::json!({
+                    "kind": "commit",
+                    "rev": job.generation,
+                    "english": english,
+                    "japanese": japanese,
+                    "single": false,
+                }),
+                true,
+            );
+        }
     } else {
         println!("EN: {english}");
         if !japanese.is_empty() {
             println!("JA: {japanese}");
-        } else {
-            tracing::debug!(%english, "skipped junk Japanese");
         }
         let _ = io::stdout().flush();
     }
