@@ -93,12 +93,14 @@
       }
 
       .clear,
-      .close {
+      .close,
+      .copy {
         border: 0;
         cursor: pointer;
       }
 
-      .clear {
+      .clear,
+      .copy {
         height: 26px;
         padding: 0 12px;
         border-radius: 999px;
@@ -109,7 +111,19 @@
         font-weight: 600;
       }
 
-      .clear:disabled {
+      .copy {
+        height: 22px;
+        padding: 0 10px;
+        justify-self: start;
+        background: var(--pill);
+        color: var(--pill-ink);
+        font-size: 11.5px;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      .clear:disabled,
+      .copy:disabled {
         opacity: 0.45;
         cursor: default;
       }
@@ -129,6 +143,28 @@
         background: rgba(255, 255, 255, 0.08);
       }
 
+      .copies,
+      .columns {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        column-gap: 28px;
+        align-items: start;
+      }
+
+      .copies {
+        margin: 0 0 8px;
+      }
+
+      body.single .copies,
+      body.single .columns {
+        grid-template-columns: 1fr;
+      }
+
+      body.single .copy-target,
+      body.single .lane-target {
+        display: none;
+      }
+
       .log {
         flex: 1;
         min-height: 0;
@@ -141,31 +177,30 @@
         line-height: 1.55;
       }
 
-      .row {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 28px;
-        padding: 2px 0 8px;
+      .lane {
+        min-width: 0;
       }
 
-      .row.single {
-        grid-template-columns: 1fr;
-      }
-
-      .col {
+      .cell {
         min-width: 0;
         font-size: 15px;
         line-height: 1.55;
         letter-spacing: -0.011em;
         white-space: pre-wrap;
         overflow-wrap: anywhere;
+        padding: 2px 0 8px;
       }
 
-      .col.en {
+      body:not(.single) .cell.source {
         color: var(--ink-soft);
       }
 
-      .row.preview .col {
+      .stack .cell:empty {
+        display: none;
+        padding: 0;
+      }
+
+      .cell.preview {
         opacity: 0.72;
       }
     </style>
@@ -190,17 +225,33 @@
         <button class="close" id="close" type="button" aria-label="閉じる">×</button>
       </header>
       <div class="note" id="note" hidden></div>
+      <div class="copies" id="copies" hidden>
+        <button class="copy" id="copy-source" type="button" disabled>英語をコピー</button>
+        <button class="copy copy-target" id="copy-target" type="button" disabled>日本語をコピー</button>
+      </div>
       <div class="log" id="log">
         <div class="placeholder" id="placeholder">聞き取り中…</div>
+        <div class="columns" id="columns">
+          <div class="lane lane-source" id="lane-source"></div>
+          <div class="lane lane-target" id="lane-target"></div>
+        </div>
       </div>
     </div>
     <script>
       var log = document.getElementById("log");
+      var columns = document.getElementById("columns");
+      var copies = document.getElementById("copies");
       var placeholder = document.getElementById("placeholder");
       var clearButton = document.getElementById("clear");
+      var copySource = document.getElementById("copy-source");
+      var copyTarget = document.getElementById("copy-target");
+      var laneSource = document.getElementById("lane-source");
+      var laneTarget = document.getElementById("lane-target");
       var follow = true;
       var settled = Object.create(null);
       var rows = Object.create(null);
+      var dragLane = null;
+      var adjusting = false;
 
       function nearBottom() {
         return log.scrollHeight - log.scrollTop - log.clientHeight < 48;
@@ -213,24 +264,37 @@
       }
 
       function refreshChrome() {
-        var hasRow = log.querySelector(".row") !== null;
+        var hasRow = Object.keys(rows).length > 0;
         placeholder.hidden = hasRow;
+        copies.hidden = !hasRow;
         clearButton.disabled = !hasRow;
+        updateCopyButtons();
       }
 
       log.addEventListener("scroll", function () {
         follow = nearBottom();
       });
 
+      function post(message) {
+        if (!window.ipc || !window.ipc.postMessage) {
+          return false;
+        }
+        window.ipc.postMessage(message);
+        return true;
+      }
+
       document.getElementById("close").addEventListener("click", function () {
-        window.ipc.postMessage("close");
+        post("close");
       });
 
       clearButton.addEventListener("click", function () {
-        log.querySelectorAll(".row").forEach(function (row) {
-          settled[row.dataset.rev] = true;
-          delete rows[row.dataset.rev];
-          row.remove();
+        Object.keys(rows).forEach(function (key) {
+          settled[key] = true;
+          var row = rows[key];
+          row.source.remove();
+          row.target.remove();
+          row.stack.remove();
+          delete rows[key];
         });
         follow = true;
         refreshChrome();
@@ -240,12 +304,96 @@
         if (event.button !== 0 || event.target.closest("button, select")) {
           return;
         }
-        window.ipc.postMessage("drag");
+        post("drag");
       });
 
       var sourceLang = document.getElementById("source");
       var targetLang = document.getElementById("target");
       var note = document.getElementById("note");
+
+      function sameLanguage() {
+        return sourceLang.value === targetLang.value;
+      }
+
+      function langLabel(code) {
+        return code === "ja" ? "日本語" : "英語";
+      }
+
+      function columnText(lane) {
+        var parts = [];
+        var nodes = lane.querySelectorAll(".cell");
+        for (var i = 0; i < nodes.length; i++) {
+          var text = nodes[i].textContent.replace(/^\s+|\s+$/g, "");
+          if (text) {
+            parts.push(text);
+          }
+        }
+        return parts.join("\n");
+      }
+
+      function hasText(lane) {
+        var nodes = lane.querySelectorAll(".cell");
+        for (var i = 0; i < nodes.length; i++) {
+          if (nodes[i].textContent.replace(/^\s+|\s+$/g, "")) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      function updateCopyButtons() {
+        var single = sameLanguage();
+        document.body.classList.toggle("single", single);
+        if (single) {
+          copySource.dataset.label = "コピー";
+        } else {
+          copySource.dataset.label = langLabel(sourceLang.value) + "をコピー";
+          copyTarget.dataset.label = langLabel(targetLang.value) + "をコピー";
+        }
+        if (copySource.dataset.busy !== "1") {
+          copySource.textContent = copySource.dataset.label;
+        }
+        if (copyTarget.dataset.busy !== "1") {
+          copyTarget.textContent = copyTarget.dataset.label;
+        }
+        copySource.setAttribute("aria-label", copySource.dataset.label);
+        copyTarget.setAttribute("aria-label", copyTarget.dataset.label);
+        copySource.disabled = !hasText(laneSource);
+        copyTarget.disabled = !hasText(laneTarget);
+      }
+
+      function bindCopy(button, lane) {
+        var timer = 0;
+        button.addEventListener("click", function () {
+          var text = columnText(lane);
+          if (!text || !post("copy:" + text)) {
+            return;
+          }
+          button.dataset.busy = "1";
+          button.textContent = "コピーしました";
+          clearTimeout(timer);
+          timer = setTimeout(function () {
+            button.dataset.busy = "";
+            button.textContent = button.dataset.label || "";
+          }, 1200);
+        });
+      }
+
+      bindCopy(copySource, laneSource);
+      bindCopy(copyTarget, laneTarget);
+
+      function applyLayout() {
+        document.body.classList.toggle("single", sameLanguage());
+        dragLane = null;
+        var keys = Object.keys(rows);
+        for (var i = 0; i < keys.length; i++) {
+          mount(rows[keys[i]]);
+        }
+        if (!sameLanguage()) {
+          alignAll();
+        }
+        refreshChrome();
+      }
 
       function publishPair() {
         var jaToEn = sourceLang.value === "ja" && targetLang.value === "en";
@@ -253,7 +401,8 @@
         note.textContent = jaToEn
           ? "日本語から英語の翻訳モデルはまだありません。聞き取った日本語だけ表示します。"
           : "";
-        window.ipc.postMessage("pair:" + sourceLang.value + ":" + targetLang.value);
+        post("pair:" + sourceLang.value + ":" + targetLang.value);
+        applyLayout();
       }
 
       sourceLang.addEventListener("change", publishPair);
@@ -271,90 +420,263 @@
         note.textContent = jaToEn
           ? "日本語から英語の翻訳モデルはまだありません。聞き取った日本語だけ表示します。"
           : "";
+        applyLayout();
       };
 
       function has(pair, key) {
         return Object.prototype.hasOwnProperty.call(pair, key);
       }
 
-      function ensureShape(row, single) {
-        var layout = single ? "single" : "split";
-        if (row.dataset.layout === layout) {
-          return;
-        }
-        row.dataset.layout = layout;
-        row.classList.toggle("single", single);
-        row.replaceChildren();
-        if (single) {
-          var text = document.createElement("div");
-          text.className = "col";
-          text.dataset.role = "text";
-          row.append(text);
-          return;
-        }
-        var en = document.createElement("div");
-        en.className = "col en";
-        en.dataset.role = "en";
-        var ja = document.createElement("div");
-        ja.className = "col ja";
-        ja.dataset.role = "ja";
-        row.append(en, ja);
+      function makeCell(rev, role) {
+        var cell = document.createElement("div");
+        cell.className = "cell " + role;
+        cell.dataset.rev = rev;
+        cell.dataset.role = role;
+        return cell;
       }
 
-      function writeRole(row, role, value) {
-        var node = row.querySelector('[data-role="' + role + '"]');
-        if (node) {
-          node.textContent = value;
-        }
+      function makeRow(rev) {
+        var stack = document.createElement("div");
+        stack.className = "stack";
+        stack.dataset.rev = rev;
+        return {
+          rev: rev,
+          source: makeCell(rev, "source"),
+          target: makeCell(rev, "target"),
+          stack: stack,
+          live: true,
+        };
       }
 
-      function place(row) {
-        var rev = Number(row.dataset.rev);
-        var rows = log.querySelectorAll(".row");
-        for (var i = 0; i < rows.length; i++) {
-          if (rows[i] !== row && Number(rows[i].dataset.rev) > rev) {
-            log.insertBefore(row, rows[i]);
-            return;
+      function insertNode(lane, node) {
+        var rev = Number(node.dataset.rev);
+        var next = null;
+        var nodes = lane.children;
+        for (var i = 0; i < nodes.length; i++) {
+          if (nodes[i] === node) {
+            continue;
+          }
+          if (Number(nodes[i].dataset.rev) > rev) {
+            next = nodes[i];
+            break;
           }
         }
-        log.append(row);
+        if (node.parentNode === lane && node.nextSibling === next) {
+          return;
+        }
+        if (next) {
+          lane.insertBefore(node, next);
+          return;
+        }
+        if (node.parentNode !== lane || node.nextSibling) {
+          lane.appendChild(node);
+        }
       }
+
+      function mount(row) {
+        row.source.classList.toggle("preview", row.live);
+        row.target.classList.toggle("preview", row.live);
+        row.source.style.minHeight = "";
+        row.target.style.minHeight = "";
+        if (sameLanguage()) {
+          if (row.source.parentNode !== row.stack) {
+            row.stack.insertBefore(row.source, row.stack.firstChild);
+          }
+          if (row.target.parentNode !== row.stack) {
+            row.stack.appendChild(row.target);
+          }
+          insertNode(laneSource, row.stack);
+          return;
+        }
+        insertNode(laneSource, row.source);
+        insertNode(laneTarget, row.target);
+        if (row.stack.parentNode) {
+          row.stack.remove();
+        }
+      }
+
+      function alignPair(row) {
+        if (row.source.parentNode !== laneSource || row.target.parentNode !== laneTarget) {
+          return;
+        }
+        row.source.style.minHeight = "0px";
+        row.target.style.minHeight = "0px";
+        var height = Math.max(row.source.scrollHeight, row.target.scrollHeight);
+        var px = height + "px";
+        row.source.style.minHeight = px;
+        row.target.style.minHeight = px;
+      }
+
+      function alignAll() {
+        if (sameLanguage()) {
+          return;
+        }
+        var keys = Object.keys(rows);
+        var list = [];
+        var i;
+        for (i = 0; i < keys.length; i++) {
+          var row = rows[keys[i]];
+          if (row.source.parentNode !== laneSource || row.target.parentNode !== laneTarget) {
+            continue;
+          }
+          row.source.style.minHeight = "0px";
+          row.target.style.minHeight = "0px";
+          list.push(row);
+        }
+        var heights = [];
+        for (i = 0; i < list.length; i++) {
+          heights.push(Math.max(list[i].source.scrollHeight, list[i].target.scrollHeight));
+        }
+        for (i = 0; i < list.length; i++) {
+          var px = heights[i] + "px";
+          list[i].source.style.minHeight = px;
+          list[i].target.style.minHeight = px;
+        }
+      }
+
+      window.addEventListener("resize", alignAll);
+
+      function paint(row, pair, live) {
+        row.live = live;
+        if (has(pair, "text")) {
+          row.source.textContent = pair.text || "";
+          row.target.textContent = "";
+        } else {
+          if (has(pair, "source")) {
+            row.source.textContent = pair.source || "";
+          } else if (has(pair, "english")) {
+            row.source.textContent = pair.english || "";
+          }
+          if (has(pair, "target")) {
+            row.target.textContent = pair.target || "";
+          } else if (has(pair, "japanese")) {
+            row.target.textContent = pair.japanese || "";
+          }
+        }
+        mount(row);
+        if (!sameLanguage()) {
+          alignPair(row);
+        }
+      }
+
+      function elementOf(node) {
+        if (!node) {
+          return null;
+        }
+        return node.nodeType === 1 ? node : node.parentElement;
+      }
+
+      function laneOf(node) {
+        var el = elementOf(node);
+        return el && el.closest(".lane");
+      }
+
+      function revOf(node) {
+        var el = elementOf(node);
+        var host = el && el.closest("[data-rev]");
+        return host ? host.dataset.rev : "";
+      }
+
+      function clampTo(lane) {
+        if (adjusting || !lane || sameLanguage()) {
+          return;
+        }
+        var sel = document.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+          return;
+        }
+        var anchorLane = laneOf(sel.anchorNode);
+        var focusLane = laneOf(sel.focusNode);
+        if (anchorLane === lane && focusLane === lane) {
+          return;
+        }
+        var focusRev = revOf(sel.focusNode);
+        var anchorRev = revOf(sel.anchorNode);
+        if (!focusRev || !anchorRev || !rows[focusRev] || !rows[anchorRev]) {
+          return;
+        }
+        var mapped = lane === laneSource ? rows[focusRev].source : rows[focusRev].target;
+        var anchorNode = anchorLane === lane ? sel.anchorNode : rows[anchorRev].source;
+        var anchorOffset = anchorLane === lane ? sel.anchorOffset : 0;
+        if (lane === laneTarget && anchorLane !== lane) {
+          anchorNode = rows[anchorRev].target;
+        }
+        var range = document.createRange();
+        try {
+          if (focusRev === anchorRev) {
+            if (lane === laneTarget) {
+              range.setStart(mapped, 0);
+              range.setEnd(anchorNode, anchorOffset);
+            } else {
+              range.setStart(anchorNode, anchorOffset);
+              range.setEnd(mapped, mapped.childNodes.length);
+            }
+          } else if (Number(focusRev) > Number(anchorRev)) {
+            range.setStart(anchorNode, anchorOffset);
+            range.setEnd(mapped, mapped.childNodes.length);
+          } else {
+            range.setStart(mapped, 0);
+            range.setEnd(anchorNode, anchorOffset);
+          }
+        } catch (err) {
+          return;
+        }
+        if (range.collapsed) {
+          return;
+        }
+        adjusting = true;
+        sel.removeAllRanges();
+        sel.addRange(range);
+        adjusting = false;
+      }
+
+      function endColumnDrag() {
+        var lane = dragLane;
+        if (!lane) {
+          return;
+        }
+        clampTo(lane);
+        setTimeout(function () {
+          if (dragLane !== lane) {
+            return;
+          }
+          clampTo(lane);
+          dragLane = null;
+        }, 0);
+      }
+
+      log.addEventListener(
+        "pointerdown",
+        function (event) {
+          if (event.button !== 0) {
+            return;
+          }
+          dragLane = event.target.closest(".lane");
+        },
+        true
+      );
+      window.addEventListener("pointerup", endColumnDrag);
+      window.addEventListener("pointercancel", function () {
+        dragLane = null;
+      });
+      window.addEventListener("blur", function () {
+        dragLane = null;
+      });
+
+      document.addEventListener("selectionchange", function () {
+        if (dragLane) {
+          clampTo(dragLane);
+        }
+      });
 
       function rowFor(rev) {
         var key = String(rev);
         if (rows[key]) {
           return rows[key];
         }
-        var row = document.createElement("div");
-        row.className = "row preview";
-        row.dataset.rev = key;
+        var row = makeRow(key);
         rows[key] = row;
-        place(row);
         return row;
-      }
-
-      function paint(row, pair, live) {
-        var single = has(pair, "single") ? !!pair.single : row.dataset.layout === "single";
-        ensureShape(row, single);
-        if (single) {
-          if (has(pair, "text")) {
-            writeRole(row, "text", pair.text || "");
-          } else if (has(pair, "japanese") || has(pair, "english") || has(pair, "source")) {
-            writeRole(row, "text", pair.text || pair.source || pair.japanese || pair.english || "");
-          }
-        } else {
-          if (has(pair, "source")) {
-            writeRole(row, "en", pair.source || "");
-          } else if (has(pair, "english")) {
-            writeRole(row, "en", pair.english || "");
-          }
-          if (has(pair, "target")) {
-            writeRole(row, "ja", pair.target || "");
-          } else if (has(pair, "japanese")) {
-            writeRole(row, "ja", pair.japanese || "");
-          }
-        }
-        row.classList.toggle("preview", live);
       }
 
       window.konnnyakuUpdate = function (pair) {
@@ -373,8 +695,10 @@
         if (pair.kind === "drop") {
           settled[rev] = true;
           var dropped = rows[rev];
-          if (dropped && dropped.classList.contains("preview")) {
-            dropped.remove();
+          if (dropped && dropped.live) {
+            dropped.source.remove();
+            dropped.target.remove();
+            dropped.stack.remove();
             delete rows[rev];
           }
           refreshChrome();
@@ -388,9 +712,6 @@
           settled[rev] = true;
           paint(row, pair, false);
         } else {
-          if (!row.classList.contains("preview") && settled[rev]) {
-            return;
-          }
           paint(row, pair, true);
         }
         refreshChrome();

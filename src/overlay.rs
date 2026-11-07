@@ -1,3 +1,5 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -68,16 +70,23 @@ pub fn run_caption_hud(
         .with_transparent(true)
         .with_html(include_str!("caption.html"))
         .with_accept_first_mouse(true)
-        .with_ipc_handler(move |request| match request.body().as_str() {
-            "close" => close_flag.store(false, Ordering::SeqCst),
-            "drag" => {
-                let _ = drag_proxy.send_event(UiEvent::Drag);
+        .with_ipc_handler(move |request| {
+            let body = request.body();
+            match body.as_str() {
+                "close" => close_flag.store(false, Ordering::SeqCst),
+                "drag" => {
+                    let _ = drag_proxy.send_event(UiEvent::Drag);
+                }
+                "pair:en:en" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::En),
+                "pair:en:ja" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::Ja),
+                "pair:ja:ja" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::Ja),
+                "pair:ja:en" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::En),
+                other => {
+                    if let Some(text) = clipboard_text(other) {
+                        copy_to_pasteboard(text);
+                    }
+                }
             }
-            "pair:en:en" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::En),
-            "pair:en:ja" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::Ja),
-            "pair:ja:ja" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::Ja),
-            "pair:ja:en" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::En),
-            _ => {}
         })
         .build(&window)
         .context("create caption webview")?;
@@ -116,4 +125,57 @@ pub fn run_caption_hud(
     });
     running.store(false, Ordering::SeqCst);
     Ok(())
+}
+
+/// Caption text from a `copy:` IPC message. Anything else, including the
+/// language and window commands, is ignored. The page is local, and the text
+/// is only written to the pasteboard.
+fn clipboard_text(body: &str) -> Option<&str> {
+    let text = body.strip_prefix("copy:")?;
+    if text.is_empty() || text.len() > 1_048_576 {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn copy_to_pasteboard(text: &str) {
+    let mut child = match Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::debug!(%err, "clipboard copy failed");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            tracing::debug!("clipboard copy failed");
+            let _ = child.wait();
+            return;
+        }
+    }
+    if child.wait().is_err() {
+        tracing::debug!("clipboard copy failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clipboard_text;
+
+    #[test]
+    fn copy_ipc_accepts_caption_text_only() {
+        assert_eq!(clipboard_text("copy:hello"), Some("hello"));
+        assert_eq!(clipboard_text("copy:日本語\n次"), Some("日本語\n次"));
+        assert_eq!(clipboard_text("close"), None);
+        assert_eq!(clipboard_text("pair:en:ja"), None);
+        assert_eq!(clipboard_text("copy:"), None);
+        let huge = format!("copy:{}", "a".repeat(1_048_577));
+        assert_eq!(clipboard_text(&huge), None);
+    }
 }
