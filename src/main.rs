@@ -2,6 +2,7 @@ mod asr;
 mod audio;
 mod haas;
 mod metrics;
+mod mix;
 #[cfg(target_os = "macos")]
 mod overlay;
 mod summary;
@@ -29,6 +30,7 @@ use crate::audio::{
 };
 use crate::haas::HaasRecognizer;
 use crate::metrics::TranslationMetrics;
+use crate::mix::{AudioMix, MIX_RATE, MixPort};
 use crate::summary::{MeetingDraft, SummarySession};
 use crate::translation::{OnnxMarianTranslator, Translator};
 use crate::vad::SpeechGate;
@@ -104,7 +106,7 @@ struct TranslateArgs {
 
 #[derive(clap::Args, Debug)]
 struct LiveArgs {
-    /// Capture from the default microphone (the default when --loopback/--app is omitted).
+    /// Capture the default microphone. Combine with --app or --loopback to start both.
     #[arg(long, default_value_t = false)]
     mic: bool,
     /// Capture default system output (all apps on that device).
@@ -339,29 +341,36 @@ fn run_translate(args: TranslateArgs) -> Result<()> {
 
 fn run_live(args: LiveArgs) -> Result<()> {
     let langs = Arc::new(LangPair::parse(&args.source, &args.target)?);
+    let hear = Arc::new(HearFlags::from_live(&args)?);
     #[cfg(target_os = "macos")]
     if !args.cli {
-        return run_live_hud(args, langs);
+        return run_live_hud(args, langs, Arc::clone(&hear));
     }
-    run_live_session(args, None, None, langs)
+    run_live_session(args, None, None, langs, hear)
 }
 
 #[cfg(target_os = "macos")]
-fn run_live_hud(args: LiveArgs, langs: Arc<LangPair>) -> Result<()> {
+fn run_live_hud(args: LiveArgs, langs: Arc<LangPair>, hear: Arc<HearFlags>) -> Result<()> {
     let running = install_ctrlc()?;
     let (tx, rx) = bounded::<String>(32);
     let capture_running = Arc::clone(&running);
     let ui_langs = Arc::clone(&langs);
+    let session_hear = Arc::clone(&hear);
     let join = std::thread::Builder::new()
         .name("konnnyaku-live".into())
         .spawn(move || {
-            let result =
-                run_live_session(args, Some(Arc::clone(&capture_running)), Some(tx), langs);
+            let result = run_live_session(
+                args,
+                Some(Arc::clone(&capture_running)),
+                Some(tx),
+                langs,
+                session_hear,
+            );
             capture_running.store(false, Ordering::SeqCst);
             result
         })
         .context("spawn live thread")?;
-    let ui = crate::overlay::run_caption_hud(Arc::clone(&running), rx, ui_langs);
+    let ui = crate::overlay::run_caption_hud(Arc::clone(&running), rx, ui_langs, hear);
     running.store(false, Ordering::SeqCst);
     let capture_result = join
         .join()
@@ -375,8 +384,9 @@ fn run_live_session(
     running: Option<Arc<AtomicBool>>,
     captions: Option<Sender<String>>,
     langs: Arc<LangPair>,
+    hear: Arc<HearFlags>,
 ) -> Result<()> {
-    let source = live_capture_source(&args)?;
+    let output_source = live_output_source(&args)?;
     let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
     let mut engine = AsrEngine::new(&asr_paths, args.threads, args.rule2)?;
     if !args.no_vad {
@@ -409,8 +419,10 @@ fn run_live_session(
         None => install_ctrlc()?,
     };
     let show_terminal = captions.is_none();
-    let label = capture_label(&source);
-    let (mut capture, mut rx) = start_capture(source.clone(), AUDIO_QUEUE_CAPACITY)?;
+    let label = hear_label(hear.input(), hear.output(), &output_source);
+    let mut input_feed = LiveFeed::new(CaptureSource::Microphone);
+    let mut output_feed = LiveFeed::new(output_source);
+    let mut mix = AudioMix::new(MIX_RATE);
     let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
     let (done_tx, done_rx) = bounded::<()>(1);
     let tail = Arc::new(CaptionTail::new());
@@ -531,11 +543,7 @@ fn run_live_session(
     });
 
     let mut display = TranscriptDisplay::new();
-    let mut buffer = Vec::new();
-    let mut sample_rate = 0_u32;
     let mut translation_queue_drops = 0_u64;
-    let mut capture_drops = 0_u64;
-    let mut last_ja_preview = 0_usize;
 
     if show_terminal {
         println!(
@@ -546,34 +554,19 @@ fn run_live_session(
     } else {
         eprintln!("Captions from {label}. Close the window or press Ctrl+C to stop.");
     }
-    while running.load(Ordering::SeqCst) {
-        let hearing_japanese = langs.source() == CaptionLang::Ja;
-        engine.set_retain_audio_finals(hearing_japanese);
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => {
-                sample_rate = chunk.sample_rate;
-                buffer.extend_from_slice(&chunk.samples);
-                let chunk_len = samples_for_ms(sample_rate, CHUNK_MS).max(1);
-                while buffer.len() >= chunk_len {
-                    let samples: Vec<f32> = buffer.drain(..chunk_len).collect();
-                    let events = engine.push_samples(sample_rate, &samples)?;
-                    translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, &route);
-                    preview_japanese(&engine, &route, &mut last_ja_preview);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                capture_drops += reconnect_capture(&mut capture, &mut rx, &source, false)?;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                capture_drops += reconnect_capture(&mut capture, &mut rx, &source, true)?;
-            }
-        }
-    }
-
-    if sample_rate > 0 && !buffer.is_empty() {
-        let events = engine.push_samples(sample_rate, &buffer)?;
-        translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, &route);
-    }
+    pump_live_audio(
+        &running,
+        &mut engine,
+        &hear,
+        &mut input_feed,
+        &mut output_feed,
+        &mut mix,
+        &mt_tx,
+        &mut display,
+        &route,
+        &captions,
+        &mut translation_queue_drops,
+    )?;
     let events = engine.finish_input()?;
     translation_queue_drops += enqueue_finals(&mt_tx, events, &mut display, &route);
     display.finish();
@@ -583,8 +576,9 @@ fn run_live_session(
     let _ = done_rx.recv_timeout(Duration::from_secs(30));
     engine
         .metrics_mut()
-        .add_drops(capture_drops + capture.drops());
-    drop(capture);
+        .add_drops(input_feed.total_drops() + output_feed.total_drops());
+    drop(input_feed);
+    drop(output_feed);
 
     eprintln!("ASR metrics: {}", engine.metrics());
     eprintln!("translation queue drops: {translation_queue_drops}");
@@ -936,13 +930,361 @@ fn asr_capture_source(args: &AsrArgs) -> Result<Option<CaptureSource>> {
     )))
 }
 
-fn live_capture_source(args: &LiveArgs) -> Result<CaptureSource> {
-    let selected =
-        usize::from(args.mic) + usize::from(args.loopback) + usize::from(args.app.is_some());
-    if selected > 1 {
-        anyhow::bail!("specify at most one of --mic, --loopback, or --app");
+fn live_output_source(args: &LiveArgs) -> Result<CaptureSource> {
+    if args.loopback && args.app.is_some() {
+        anyhow::bail!("specify only one of --loopback or --app");
     }
-    Ok(selected_capture_source(args.loopback, args.app.as_deref()))
+    if args.loopback {
+        Ok(CaptureSource::Loopback)
+    } else if let Some(app) = &args.app {
+        Ok(CaptureSource::Application(app.clone()))
+    } else {
+        Ok(CaptureSource::Loopback)
+    }
+}
+
+fn hear_label(input: bool, output: bool, output_source: &CaptureSource) -> String {
+    match (input, output) {
+        (true, true) => format!("microphone and {}", capture_label(output_source)),
+        (true, false) => "microphone".to_string(),
+        (false, true) => capture_label(output_source),
+        (false, false) => "no audio".to_string(),
+    }
+}
+
+struct HearFlags {
+    input: AtomicBool,
+    output: AtomicBool,
+}
+
+impl HearFlags {
+    fn from_live(args: &LiveArgs) -> Result<Self> {
+        let output_selected = args.loopback || args.app.is_some();
+        if args.loopback && args.app.is_some() {
+            anyhow::bail!("specify only one of --loopback or --app");
+        }
+        let input = args.mic || !output_selected;
+        Ok(Self {
+            input: AtomicBool::new(input),
+            output: AtomicBool::new(output_selected),
+        })
+    }
+
+    fn input(&self) -> bool {
+        self.input.load(Ordering::Relaxed)
+    }
+
+    fn output(&self) -> bool {
+        self.output.load(Ordering::Relaxed)
+    }
+
+    fn set_input(&self, enabled: bool) {
+        self.input.store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_output(&self, enabled: bool) {
+        self.output.store(enabled, Ordering::Relaxed);
+    }
+}
+
+struct OpenFeed {
+    capture: AudioCapture,
+    rx: Receiver<AudioChunk>,
+}
+
+struct LiveFeed {
+    source: CaptureSource,
+    open: Option<OpenFeed>,
+    drops: u64,
+}
+
+impl LiveFeed {
+    fn new(source: CaptureSource) -> Self {
+        Self {
+            source,
+            open: None,
+            drops: 0,
+        }
+    }
+
+    fn total_drops(&self) -> u64 {
+        self.drops
+            + self
+                .open
+                .as_ref()
+                .map(|open| open.capture.drops())
+                .unwrap_or(0)
+    }
+
+    fn ensure(&mut self, enabled: bool) -> Result<()> {
+        if !enabled {
+            self.close();
+            return Ok(());
+        }
+        if self.open.is_some() {
+            return Ok(());
+        }
+        self.start()
+    }
+
+    fn reopen(&mut self) -> Result<()> {
+        self.close();
+        std::thread::sleep(Duration::from_millis(400));
+        self.start()
+    }
+
+    fn start(&mut self) -> Result<()> {
+        let (capture, rx) = start_capture(self.source.clone(), AUDIO_QUEUE_CAPACITY)?;
+        self.open = Some(OpenFeed { capture, rx });
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        if let Some(open) = self.open.take() {
+            self.drops += open.capture.drops();
+        }
+    }
+
+    fn invalidated(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.capture.is_invalidated())
+    }
+}
+
+fn pump_live_audio(
+    running: &AtomicBool,
+    engine: &mut AsrEngine,
+    hear: &HearFlags,
+    input: &mut LiveFeed,
+    output: &mut LiveFeed,
+    mix: &mut AudioMix,
+    mt_tx: &Sender<TranslationJob>,
+    display: &mut TranscriptDisplay,
+    route: &LiveRoute,
+    ui: &Option<Sender<String>>,
+    translation_drops: &mut u64,
+) -> Result<()> {
+    let mut active_in = hear.input();
+    let mut active_out = hear.output();
+    mix.set_enabled(active_in, active_out);
+    let mut buffer = Vec::new();
+    let mut last_ja_preview = 0_usize;
+    let mut strict = true;
+    let frame = samples_for_ms(MIX_RATE, CHUNK_MS).max(1);
+
+    while running.load(Ordering::SeqCst) {
+        let want_in = hear.input();
+        let want_out = hear.output();
+        if want_in != active_in || want_out != active_out {
+            *translation_drops += enqueue_finals(mt_tx, engine.end_utterance()?, display, route);
+            mix.set_enabled(want_in, want_out);
+            active_in = want_in;
+            active_out = want_out;
+        }
+        if let Err(err) = sync_feed(input, active_in, true, hear, ui, active_out, strict) {
+            return Err(err);
+        }
+        active_in = hear.input();
+        if let Err(err) = sync_feed(output, active_out, false, hear, ui, active_in, strict) {
+            return Err(err);
+        }
+        active_out = hear.output();
+        mix.set_enabled(active_in, active_out);
+
+        let (input_dead, output_dead) = collect_feeds(input, output, mix);
+        if active_in && (input_dead || input.invalidated()) {
+            recover_feed(input, true, hear, ui, active_out, strict)?;
+            active_in = hear.input();
+        }
+        if active_out && (output_dead || output.invalidated()) {
+            recover_feed(output, false, hear, ui, active_in, strict)?;
+            active_out = hear.output();
+        }
+        if !active_in {
+            input.close();
+        }
+        if !active_out {
+            output.close();
+        }
+        mix.set_enabled(active_in, active_out);
+        strict = false;
+
+        buffer.extend(mix.drain());
+        let hearing_japanese = route.langs.source() == CaptionLang::Ja;
+        engine.set_retain_audio_finals(hearing_japanese);
+        while buffer.len() >= frame {
+            let samples: Vec<f32> = buffer.drain(..frame).collect();
+            let events = engine.push_samples(MIX_RATE, &samples)?;
+            *translation_drops += enqueue_finals(mt_tx, events, display, route);
+            preview_japanese(engine, route, &mut last_ja_preview);
+        }
+    }
+
+    if !buffer.is_empty() {
+        let events = engine.push_samples(MIX_RATE, &buffer)?;
+        *translation_drops += enqueue_finals(mt_tx, events, display, route);
+    }
+    Ok(())
+}
+
+fn sync_feed(
+    feed: &mut LiveFeed,
+    enabled: bool,
+    microphone: bool,
+    hear: &HearFlags,
+    ui: &Option<Sender<String>>,
+    other_enabled: bool,
+    strict: bool,
+) -> Result<()> {
+    match feed.ensure(enabled) {
+        Ok(()) => Ok(()),
+        Err(err) if strict && enabled => Err(err),
+        Err(err) => {
+            report_feed_failure(microphone, hear, ui, other_enabled, &err);
+            Ok(())
+        }
+    }
+}
+
+fn recover_feed(
+    feed: &mut LiveFeed,
+    microphone: bool,
+    hear: &HearFlags,
+    ui: &Option<Sender<String>>,
+    other_enabled: bool,
+    strict: bool,
+) -> Result<()> {
+    match feed.reopen() {
+        Ok(()) => Ok(()),
+        Err(err) if strict => Err(err),
+        Err(err) => {
+            report_feed_failure(microphone, hear, ui, other_enabled, &err);
+            Ok(())
+        }
+    }
+}
+
+fn report_feed_failure(
+    microphone: bool,
+    hear: &HearFlags,
+    ui: &Option<Sender<String>>,
+    other_enabled: bool,
+    err: &anyhow::Error,
+) {
+    tracing::warn!(%err, microphone, "audio capture unavailable");
+    if microphone {
+        hear.set_input(false);
+    } else {
+        hear.set_output(false);
+    }
+    let which = if microphone { "マイク" } else { "出力" };
+    let detail = short_error(err);
+    let message = format!("{which}を開始できませんでした。{detail}");
+    let (input, output) = if microphone {
+        (false, other_enabled)
+    } else {
+        (other_enabled, false)
+    };
+    send_hear(ui, input, output, &message);
+}
+
+fn send_hear(ui: &Option<Sender<String>>, input: bool, output: bool, message: &str) {
+    let Some(ui) = ui else {
+        return;
+    };
+    send_caption(
+        ui,
+        &serde_json::json!({
+            "kind": "hear",
+            "input": input,
+            "output": output,
+            "message": message,
+        }),
+        true,
+    );
+}
+
+fn short_error(err: &anyhow::Error) -> String {
+    let text = err.to_string();
+    let mut chars = text.chars();
+    let short: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+fn collect_feeds(input: &LiveFeed, output: &LiveFeed, mix: &mut AudioMix) -> (bool, bool) {
+    let input_rx = input.open.as_ref().map(|open| open.rx.clone());
+    let output_rx = output.open.as_ref().map(|open| open.rx.clone());
+    let timeout = Duration::from_millis(100);
+    let mut input_dead = false;
+    let mut output_dead = false;
+    match (input_rx.as_ref(), output_rx.as_ref()) {
+        (Some(input_rx), Some(output_rx)) => {
+            select! {
+                recv(input_rx) -> msg => {
+                    input_dead = !push_chunk(mix, MixPort::Input, msg);
+                }
+                recv(output_rx) -> msg => {
+                    output_dead = !push_chunk(mix, MixPort::Output, msg);
+                }
+                default(timeout) => {}
+            }
+            input_dead |= !drain_pending(mix, MixPort::Input, input_rx);
+            output_dead |= !drain_pending(mix, MixPort::Output, output_rx);
+        }
+        (Some(rx), None) => {
+            input_dead = !wait_feed(mix, MixPort::Input, rx, timeout);
+        }
+        (None, Some(rx)) => {
+            output_dead = !wait_feed(mix, MixPort::Output, rx, timeout);
+        }
+        (None, None) => std::thread::sleep(timeout),
+    }
+    (input_dead, output_dead)
+}
+
+fn wait_feed(
+    mix: &mut AudioMix,
+    port: MixPort,
+    rx: &Receiver<AudioChunk>,
+    timeout: Duration,
+) -> bool {
+    match rx.recv_timeout(timeout) {
+        Ok(chunk) => {
+            mix.push(port, chunk.sample_rate, &chunk.samples);
+            drain_pending(mix, port, rx)
+        }
+        Err(RecvTimeoutError::Timeout) => true,
+        Err(RecvTimeoutError::Disconnected) => false,
+    }
+}
+
+fn push_chunk(
+    mix: &mut AudioMix,
+    port: MixPort,
+    msg: Result<AudioChunk, crossbeam_channel::RecvError>,
+) -> bool {
+    match msg {
+        Ok(chunk) => {
+            mix.push(port, chunk.sample_rate, &chunk.samples);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn drain_pending(mix: &mut AudioMix, port: MixPort, rx: &Receiver<AudioChunk>) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(chunk) => mix.push(port, chunk.sample_rate, &chunk.samples),
+            Err(crossbeam_channel::TryRecvError::Empty) => return true,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
+        }
+    }
 }
 
 fn selected_capture_source(loopback: bool, app: Option<&str>) -> CaptureSource {

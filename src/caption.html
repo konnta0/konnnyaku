@@ -85,6 +85,32 @@
         font-size: 12px;
       }
 
+      .hear {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .hear-btn {
+        height: 26px;
+        border: 0;
+        border-radius: 8px;
+        padding: 0 8px;
+        background: var(--pill);
+        color: var(--ink-faint);
+        font: inherit;
+        font-size: 12.5px;
+        font-weight: 600;
+        cursor: pointer;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      .hear-btn[aria-pressed="true"] {
+        background: rgba(255, 255, 255, 0.22);
+        color: var(--ink);
+      }
+
       .note {
         color: var(--ink-faint);
         font-size: 12.5px;
@@ -209,6 +235,10 @@
     <div class="card">
       <header class="titlebar" id="titlebar">
         <div class="title">文字起こし</div>
+        <div class="hear">
+          <button class="hear-btn" id="hear-input" type="button" aria-pressed="true">入力</button>
+          <button class="hear-btn" id="hear-output" type="button" aria-pressed="false">出力</button>
+        </div>
         <div class="spacer"></div>
         <div class="langs">
           <select id="source" aria-label="入力言語">
@@ -225,6 +255,7 @@
         <button class="close" id="close" type="button" aria-label="閉じる">×</button>
       </header>
       <div class="note" id="note" hidden></div>
+      <div class="note" id="hear-note" hidden></div>
       <div class="copies" id="copies" hidden>
         <button class="copy" id="copy-source" type="button" disabled>英語をコピー</button>
         <button class="copy copy-target" id="copy-target" type="button" disabled>日本語をコピー</button>
@@ -310,6 +341,51 @@
       var sourceLang = document.getElementById("source");
       var targetLang = document.getElementById("target");
       var note = document.getElementById("note");
+      var hearInput = document.getElementById("hear-input");
+      var hearOutput = document.getElementById("hear-output");
+      var hearNote = document.getElementById("hear-note");
+      var hearError = "";
+
+      function hearOn(button) {
+        return button.getAttribute("aria-pressed") === "true";
+      }
+
+      function refreshHearNote() {
+        var input = hearOn(hearInput);
+        var output = hearOn(hearOutput);
+        var text = hearError;
+        if (!text) {
+          if (!input && !output) {
+            text = "入力も出力もオフです。";
+          } else if (input && output) {
+            text = "スピーカーだと、出力の音がマイクにも入ります。";
+          }
+        }
+        hearNote.hidden = !text;
+        hearNote.textContent = text || "";
+      }
+
+      function toggleHear(button, kind) {
+        var on = !hearOn(button);
+        button.setAttribute("aria-pressed", on ? "true" : "false");
+        hearError = "";
+        post("hear:" + kind + ":" + (on ? "1" : "0"));
+        refreshHearNote();
+      }
+
+      hearInput.addEventListener("click", function () {
+        toggleHear(hearInput, "in");
+      });
+      hearOutput.addEventListener("click", function () {
+        toggleHear(hearOutput, "out");
+      });
+
+      window.konnnyakuHear = function (input, output, message) {
+        hearInput.setAttribute("aria-pressed", input ? "true" : "false");
+        hearOutput.setAttribute("aria-pressed", output ? "true" : "false");
+        hearError = message || "";
+        refreshHearNote();
+      };
 
       function sameLanguage() {
         return sourceLang.value === targetLang.value;
@@ -686,6 +762,10 @@
         if (pair.kind === "status") {
           note.hidden = !pair.message;
           note.textContent = pair.message || "";
+          return;
+        }
+        if (pair.kind === "hear") {
+          window.konnnyakuHear(!!pair.input, !!pair.output, pair.message || "");
           return;
         }
         if (pair.rev === undefined || pair.rev === null) {

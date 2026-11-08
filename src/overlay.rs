@@ -23,6 +23,7 @@ pub fn run_caption_hud(
     running: Arc<AtomicBool>,
     lines: Receiver<String>,
     langs: Arc<crate::LangPair>,
+    hear: Arc<crate::HearFlags>,
 ) -> Result<()> {
     let mut event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -61,10 +62,13 @@ pub fn run_caption_hud(
     let close_flag = Arc::clone(&running);
     let drag_proxy = proxy;
     let ipc_langs = Arc::clone(&langs);
+    let ipc_hear = Arc::clone(&hear);
     let init = format!(
-        "window.konnnyakuPair && window.konnnyakuPair('{}','{}')",
+        "window.konnnyakuPair && window.konnnyakuPair('{}','{}'); window.konnnyakuHear && window.konnnyakuHear({}, {})",
         langs.source().label(),
-        langs.target().label()
+        langs.target().label(),
+        hear.input(),
+        hear.output()
     );
     let webview = WebViewBuilder::new()
         .with_transparent(true)
@@ -81,6 +85,10 @@ pub fn run_caption_hud(
                 "pair:en:ja" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::Ja),
                 "pair:ja:ja" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::Ja),
                 "pair:ja:en" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::En),
+                "hear:in:0" => ipc_hear.set_input(false),
+                "hear:in:1" => ipc_hear.set_input(true),
+                "hear:out:0" => ipc_hear.set_output(false),
+                "hear:out:1" => ipc_hear.set_output(true),
                 other => {
                     if let Some(text) = clipboard_text(other) {
                         copy_to_pasteboard(text);

@@ -180,6 +180,14 @@ impl AsrEngine {
         Ok(Vec::new())
     }
 
+    /// Close the open utterance so the next samples start a new line.
+    pub fn end_utterance(&mut self) -> Result<Vec<AsrEvent>> {
+        if self.utterance.is_empty() && self.last_text.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self.finalize_utterance())
+    }
+
     /// Flush trailing audio after a file or capture stop.
     pub fn finish_input(&mut self) -> Result<Vec<AsrEvent>> {
         if let Some(vad) = self.vad.as_mut() {
