@@ -140,6 +140,11 @@ impl AsrEngine {
         self.utterance.len()
     }
 
+    /// Sample rate of the buffered utterance. Zero when nothing is buffered.
+    pub fn utterance_rate(&self) -> u32 {
+        self.utterance_rate
+    }
+
     /// Copy of the open utterance. Empty when nothing is buffered.
     pub fn snapshot_utterance(&self) -> (u32, Vec<f32>) {
         (self.utterance_rate, self.utterance.clone())
@@ -178,6 +183,26 @@ impl AsrEngine {
         }
 
         Ok(Vec::new())
+    }
+
+    /// Close a turn that has already run for `max_secs` of speech.
+    ///
+    /// Continuous talk never reaches the silence endpoint, so the caption would
+    /// stay one growing line. Splitting gives translation and speaker labels a
+    /// finished slice to work on.
+    pub fn take_if_long(&mut self, max_secs: u32) -> Result<Vec<AsrEvent>> {
+        let rate = self.utterance_rate;
+        if rate == 0 || max_secs == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = (rate as usize).saturating_mul(max_secs as usize);
+        if self.utterance.len() < limit {
+            return Ok(Vec::new());
+        }
+        if self.last_text.trim().is_empty() && !self.retain_audio_finals {
+            return Ok(Vec::new());
+        }
+        self.end_utterance()
     }
 
     /// Close the open utterance so the next samples start a new line.

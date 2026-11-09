@@ -177,4 +177,22 @@ mod tests {
             "{text}"
         );
     }
+
+    #[test]
+    fn distil_small_rescores_a_short_clip_when_requested() {
+        if std::env::var("KONNNYAKU_DISTIL").is_err() {
+            return;
+        }
+        let dir = Path::new("models/asr/whisper-distil-small.en");
+        if !dir.join("distil-small.en-encoder.int8.onnx").is_file() {
+            return;
+        }
+        let wav = Path::new("models/asr/whisper-tiny.en/test_wavs/0.wav");
+        let text = transcribe_wav(dir, wav);
+        let upper = text.to_ascii_uppercase();
+        assert!(
+            upper.contains("NIGHTFALL") || upper.contains("YELLOW"),
+            "{text}"
+        );
+    }
 }

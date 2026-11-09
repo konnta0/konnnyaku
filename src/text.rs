@@ -33,6 +33,69 @@ pub fn keep_japanese(text: &str) -> Option<String> {
     }
 }
 
+/// What the live English line still needs translated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LivePiece {
+    /// The new words are still the unstable tail, or there are not enough of them yet.
+    Wait,
+    /// The recognizer rewrote words that were already translated.
+    Reset,
+    /// Translate `piece`, then treat `covered` as done.
+    Ready { covered: String, piece: String },
+}
+
+/// Next clause to translate while a utterance is still open.
+///
+/// The last few words stay untranslated because the streaming recognizer rewrites them.
+/// Already-translated words are not sent again, so a long turn does not restart from the top.
+pub fn next_live_piece(covered: &str, full: &str) -> LivePiece {
+    const HOLD_TAIL: usize = 3;
+    const MIN_NEW: usize = 6;
+    const MAX_PIECE: usize = 12;
+
+    let full_words = words(full);
+    let covered_words = words(covered);
+    if !full_words.starts_with(&covered_words) {
+        return LivePiece::Reset;
+    }
+    let stable = full_words.len().saturating_sub(HOLD_TAIL);
+    if stable <= covered_words.len() {
+        return LivePiece::Wait;
+    }
+    let new_words = stable - covered_words.len();
+    if new_words < MIN_NEW {
+        return LivePiece::Wait;
+    }
+    let take = new_words.min(MAX_PIECE);
+    let end = covered_words.len() + take;
+    LivePiece::Ready {
+        covered: full_words[..end].join(" "),
+        piece: full_words[covered_words.len()..end].join(" "),
+    }
+}
+
+/// True when `full` still begins with the words already translated.
+pub fn hypothesis_extends(covered: &str, full: &str) -> bool {
+    words(full).starts_with(&words(covered))
+}
+
+/// Split English into pieces of at most `max_words` so one translation pass stays short.
+pub fn english_pieces(text: &str, max_words: usize) -> Vec<String> {
+    let words = words(text);
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let max_words = max_words.max(1);
+    words
+        .chunks(max_words)
+        .map(|chunk| chunk.join(" "))
+        .collect()
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
 fn collapse_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -131,6 +194,49 @@ mod tests {
             prepare_english("The unknown server failed."),
             Some("The unknown server failed.".to_string())
         );
+    }
+
+    #[test]
+    fn live_translation_follows_new_words_only() {
+        assert_eq!(next_live_piece("", "one two three four"), LivePiece::Wait);
+        let first = next_live_piece("", "will i get an accessory right and then when");
+        let LivePiece::Ready { covered, piece } = first else {
+            panic!("expected a first piece, got {first:?}");
+        };
+        assert_eq!(covered, "will i get an accessory right");
+        assert_eq!(piece, covered);
+        assert_eq!(
+            next_live_piece(&covered, "will i get an accessory right and then"),
+            LivePiece::Wait
+        );
+        let more = "will i get an accessory right and then when i shoot it i will hold";
+        let LivePiece::Ready {
+            covered: next,
+            piece: suffix,
+        } = next_live_piece(&covered, more)
+        else {
+            panic!("expected a suffix");
+        };
+        assert_eq!(suffix, "and then when i shoot it");
+        assert!(next.ends_with(&suffix));
+        assert_eq!(
+            next_live_piece(
+                &covered,
+                "will i get a different accessory right and then when i shoot"
+            ),
+            LivePiece::Reset
+        );
+    }
+
+    #[test]
+    fn splits_long_english_into_short_pieces() {
+        let pieces = english_pieces("a b c d e", 2);
+        assert_eq!(
+            pieces,
+            vec!["a b".to_string(), "c d".to_string(), "e".to_string()]
+        );
+        assert!(hypothesis_extends("a b", "a b c"));
+        assert!(!hypothesis_extends("a b", "a c"));
     }
 
     #[test]

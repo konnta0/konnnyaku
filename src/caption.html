@@ -229,6 +229,28 @@
       .cell.preview {
         opacity: 0.72;
       }
+
+      .who {
+        display: inline-block;
+        margin-right: 6px;
+        padding: 0 6px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.14);
+        color: var(--ink);
+        font-size: 11px;
+        font-weight: 650;
+        line-height: 1.45;
+        vertical-align: 1px;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      .who.s0 { background: rgba(224, 164, 74, 0.38); }
+      .who.s1 { background: rgba(92, 156, 214, 0.4); }
+      .who.s2 { background: rgba(94, 176, 140, 0.4); }
+      .who.s3 { background: rgba(196, 112, 138, 0.4); }
+      .who.s4 { background: rgba(150, 132, 204, 0.42); }
+      .who.s5 { background: rgba(176, 176, 176, 0.28); }
     </style>
   </head>
   <body>
@@ -521,6 +543,7 @@
           target: makeCell(rev, "target"),
           stack: stack,
           live: true,
+          refined: false,
         };
       }
 
@@ -612,9 +635,39 @@
 
       window.addEventListener("resize", alignAll);
 
+      function fillTurns(cell, turns, field) {
+        cell.replaceChildren();
+        var wrote = false;
+        for (var i = 0; i < turns.length; i++) {
+          var value = turns[i][field];
+          if (value === undefined || value === null || String(value) === "") {
+            continue;
+          }
+          if (wrote) {
+            cell.appendChild(document.createTextNode("\n"));
+          }
+          var speaker = Number(turns[i].speaker) || 0;
+          if (speaker > 0) {
+            var who = document.createElement("span");
+            who.className = "who s" + ((speaker - 1) % 6);
+            who.textContent = "話者 " + speaker + " ";
+            cell.appendChild(who);
+          }
+          cell.appendChild(document.createTextNode(String(value)));
+          wrote = true;
+        }
+      }
+
       function paint(row, pair, live) {
         row.live = live;
-        if (has(pair, "text")) {
+        if (has(pair, "turns") && Array.isArray(pair.turns)) {
+          fillTurns(row.source, pair.turns, "source");
+          if (pair.single) {
+            row.target.textContent = "";
+          } else {
+            fillTurns(row.target, pair.turns, "target");
+          }
+        } else if (has(pair, "text")) {
           row.source.textContent = pair.text || "";
           row.target.textContent = "";
         } else {
@@ -788,6 +841,12 @@
           return;
         }
         var row = rowFor(rev);
+        if (pair.rough && row.refined) {
+          return;
+        }
+        if (!pair.rough && pair.kind !== "commit") {
+          row.refined = true;
+        }
         if (pair.kind === "commit") {
           settled[rev] = true;
           paint(row, pair, false);
