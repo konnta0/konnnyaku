@@ -64,9 +64,8 @@ pub fn run_caption_hud(
     let ipc_langs = Arc::clone(&langs);
     let ipc_hear = Arc::clone(&hear);
     let init = format!(
-        "window.konnnyakuPair && window.konnnyakuPair('{}','{}'); window.konnnyakuHear && window.konnnyakuHear({}, {})",
-        langs.source().label(),
-        langs.target().label(),
+        "window.konnnyakuPrimary && window.konnnyakuPrimary('{}'); window.konnnyakuHear && window.konnnyakuHear({}, {})",
+        langs.primary().label(),
         hear.input(),
         hear.output()
     );
@@ -81,10 +80,8 @@ pub fn run_caption_hud(
                 "drag" => {
                     let _ = drag_proxy.send_event(UiEvent::Drag);
                 }
-                "pair:en:en" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::En),
-                "pair:en:ja" => ipc_langs.set(crate::CaptionLang::En, crate::CaptionLang::Ja),
-                "pair:ja:ja" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::Ja),
-                "pair:ja:en" => ipc_langs.set(crate::CaptionLang::Ja, crate::CaptionLang::En),
+                "primary:en" => ipc_langs.set_primary(crate::CaptionLang::En),
+                "primary:ja" => ipc_langs.set_primary(crate::CaptionLang::Ja),
                 "hear:in:0" => ipc_hear.set_input(false),
                 "hear:in:1" => ipc_hear.set_input(true),
                 "hear:out:0" => ipc_hear.set_output(false),

@@ -34,6 +34,7 @@ pub fn keep_japanese(text: &str) -> Option<String> {
 }
 
 /// What the live English line still needs translated.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LivePiece {
     /// The new words are still the unstable tail, or there are not enough of them yet.
@@ -44,10 +45,11 @@ pub enum LivePiece {
     Ready { covered: String, piece: String },
 }
 
-/// Next clause to translate while a utterance is still open.
+/// Next clause to translate while an utterance is still open.
 ///
 /// The last few words stay untranslated because the streaming recognizer rewrites them.
 /// Already-translated words are not sent again, so a long turn does not restart from the top.
+#[cfg(test)]
 pub fn next_live_piece(covered: &str, full: &str) -> LivePiece {
     const HOLD_TAIL: usize = 3;
     const MIN_NEW: usize = 6;
@@ -75,6 +77,7 @@ pub fn next_live_piece(covered: &str, full: &str) -> LivePiece {
 }
 
 /// True when `full` still begins with the words already translated.
+#[cfg(test)]
 pub fn hypothesis_extends(covered: &str, full: &str) -> bool {
     words(full).starts_with(&words(covered))
 }

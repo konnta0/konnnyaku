@@ -214,8 +214,9 @@ impl OnnxMarianTranslator {
     }
 }
 
-impl Translator for OnnxMarianTranslator {
-    fn translate(&mut self, text: &str) -> anyhow::Result<String> {
+impl OnnxMarianTranslator {
+    /// Translate `text`. Japanese targets drop spaces; English targets keep words.
+    pub fn translate_into(&mut self, text: &str, japanese_target: bool) -> Result<String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(String::new());
@@ -224,12 +225,22 @@ impl Translator for OnnxMarianTranslator {
         let (ids, mask) = self.encode_source(trimmed)?;
         let (shape, hidden) = self.run_encoder(&ids, &mask)?;
         let tokens = self.greedy_decode(&hidden, &shape)?;
-        let japanese = self
+        let decoded = self
             .target_tokenizer
             .decode(&tokens, true)
             .map_err(|err| anyhow!("decode target: {err}"))?;
         self.metrics.record(start.elapsed());
-        Ok(text::cleanup_japanese(&japanese))
+        if japanese_target {
+            Ok(text::cleanup_japanese(&decoded))
+        } else {
+            Ok(decoded.split_whitespace().collect::<Vec<_>>().join(" "))
+        }
+    }
+}
+
+impl Translator for OnnxMarianTranslator {
+    fn translate(&mut self, text: &str) -> anyhow::Result<String> {
+        self.translate_into(text, true)
     }
 }
 
@@ -329,6 +340,31 @@ fn encoder_seq_len(shape: &[usize]) -> usize {
         [_batch, seq, _hidden] => *seq,
         [seq, _hidden] => *seq,
         other => other.get(1).copied().unwrap_or(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_a_japanese_sentence_when_requested() {
+        if std::env::var("KONNNYAKU_JA_EN").is_err() {
+            return;
+        }
+        let dir = Path::new("models/translation/marian-ja-en/onnx");
+        if !dir.join("encoder_model.onnx").is_file() {
+            return;
+        }
+        let mut model = OnnxMarianTranslator::from_dir(dir).expect("ja-en");
+        let english = model
+            .translate_into("会議は十時半に始まります。", false)
+            .expect("translate");
+        let lower = english.to_ascii_lowercase();
+        assert!(
+            lower.contains("meeting") || lower.contains("conference"),
+            "{english}"
+        );
     }
 }
 

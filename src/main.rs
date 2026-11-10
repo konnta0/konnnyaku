@@ -2,6 +2,7 @@ mod asr;
 mod audio;
 mod diar;
 mod haas;
+mod lid;
 mod metrics;
 mod mix;
 #[cfg(target_os = "macos")]
@@ -38,8 +39,10 @@ use crate::vad::SpeechGate;
 use crate::whisper::WhisperRescorer;
 
 const DEFAULT_ASR_DIR: &str = "models/asr/zipformer-en";
-const DEFAULT_RESCORE_DIR: &str = "models/asr/whisper-distil-small.en";
+const DEFAULT_RESCORE_DIR: &str = "models/asr/parakeet-en";
+const DEFAULT_LID_DIR: &str = "models/asr/whisper-tiny";
 const DEFAULT_MT_DIR: &str = "models/translation/marian-en-ja/onnx";
+const DEFAULT_MT_JA_EN_DIR: &str = "models/translation/marian-ja-en/onnx";
 const AUDIO_QUEUE_CAPACITY: usize = 50;
 const TRANSLATION_QUEUE_CAPACITY: usize = 8;
 const CHUNK_MS: u32 = 200;
@@ -123,12 +126,9 @@ struct LiveArgs {
     /// Keep captions in the terminal. On macOS the default is a floating window.
     #[arg(long, default_value_t = false)]
     cli: bool,
-    /// Spoken language. `en` or `ja`.
-    #[arg(long, default_value = "en")]
-    source: String,
-    /// Caption language. `en` or `ja`.
+    /// Language to read. Speech in the other language is translated into this one.
     #[arg(long, default_value = "ja")]
-    target: String,
+    primary: String,
     /// Haas Japanese ONNX directory.
     #[arg(long, default_value = "models/asr/haas-ja")]
     haas_dir: PathBuf,
@@ -138,22 +138,28 @@ struct LiveArgs {
     /// Directory containing encoder/decoder/joiner/tokens.
     #[arg(long, default_value = DEFAULT_ASR_DIR)]
     asr_model_dir: PathBuf,
-    /// Directory containing encoder/decoder ONNX and tokenizers.
+    /// English-to-Japanese Marian ONNX directory.
     #[arg(long, default_value = DEFAULT_MT_DIR)]
     mt_model_dir: PathBuf,
+    /// Japanese-to-English Marian ONNX directory.
+    #[arg(long, default_value = DEFAULT_MT_JA_EN_DIR)]
+    mt_ja_en_dir: PathBuf,
+    /// Multilingual Whisper tiny directory used to detect English or Japanese.
+    #[arg(long, default_value = DEFAULT_LID_DIR)]
+    lid_dir: PathBuf,
     /// Endpoint rule2 trailing silence in seconds.
     #[arg(long, default_value_t = 0.8)]
     rule2: f32,
     /// ONNX Runtime threads inside sherpa-onnx.
     #[arg(long, default_value_t = 2)]
     threads: i32,
-    /// English rescoring model. Whisper files, or a Parakeet directory with a joiner.
+    /// English recognizer. A Parakeet directory, or Whisper files without a joiner.
     #[arg(long, default_value = DEFAULT_RESCORE_DIR)]
     whisper_dir: PathBuf,
     /// Silero VAD ONNX path.
     #[arg(long, default_value = "models/asr/silero_vad.onnx")]
     vad_model: PathBuf,
-    /// Disable English rescoring of Zipformer finals.
+    /// Disable the English recognizer and keep Zipformer text.
     #[arg(long, default_value_t = false)]
     no_whisper: bool,
     /// Disable Silero VAD music suppression.
@@ -348,7 +354,7 @@ fn run_translate(args: TranslateArgs) -> Result<()> {
 }
 
 fn run_live(args: LiveArgs) -> Result<()> {
-    let langs = Arc::new(LangPair::parse(&args.source, &args.target)?);
+    let langs = Arc::new(LangPair::parse(&args.primary)?);
     let hear = Arc::new(HearFlags::from_live(&args)?);
     #[cfg(target_os = "macos")]
     if !args.cli {
@@ -406,6 +412,7 @@ fn run_live_session(
             ),
         }
     }
+    engine.set_retain_audio_finals(true);
     let whisper = if args.no_whisper {
         None
     } else {
@@ -434,10 +441,10 @@ fn run_live_session(
     let (mt_tx, mt_rx) = bounded::<TranslationJob>(TRANSLATION_QUEUE_CAPACITY);
     let (done_tx, done_rx) = bounded::<()>(1);
     let tail = Arc::new(CaptionTail::new());
-    let ja_inbox = Arc::new(JaInbox::default());
     let en_inbox = Arc::new(EnInbox::default());
-    let (ja_kick_tx, ja_kick_rx) = bounded::<()>(1);
     let haas_dir = args.haas_dir.clone();
+    let lid_dir = args.lid_dir.clone();
+    let mt_ja_en_dir = args.mt_ja_en_dir.clone();
     let haas_threads = args.threads;
     let diar_dir = args.diar_dir.clone();
     let (en_kick_tx, en_kick_rx) = if captions.is_some() {
@@ -447,26 +454,19 @@ fn run_live_session(
         (None, None)
     };
     let route = LiveRoute {
-        langs: Arc::clone(&langs),
         ui: captions.clone(),
         tail: Arc::clone(&tail),
         en_kick: en_kick_tx,
-        ja_inbox: Arc::clone(&ja_inbox),
-        ja_kick: ja_kick_tx,
         en_inbox: Arc::clone(&en_inbox),
     };
     let worker_langs = Arc::clone(&langs);
     let worker_ui = captions.clone();
     let worker_tail = Arc::clone(&tail);
-    let worker_inbox = Arc::clone(&ja_inbox);
     let worker_en_inbox = Arc::clone(&en_inbox);
 
     let mt_thread = std::thread::spawn(move || -> Result<TranslationMetrics> {
         let mut e2e = TranslationMetrics::new()?;
-        let mut translated = TailTranslation::default();
-        let mut ja_model: Option<HaasRecognizer> = None;
-        let mut ja_failed = false;
-        let mut speakers = SpeakerState::new(diar_dir, haas_threads);
+        let mut kit = RecognizeKit::new(haas_dir, lid_dir, mt_ja_en_dir, diar_dir, haas_threads);
         if let Some(en_kick_rx) = en_kick_rx {
             let ui = worker_ui.expect("caption sender");
             loop {
@@ -480,26 +480,21 @@ fn run_live_session(
                                 job,
                                 Some(&ui),
                                 &worker_langs,
-                                &mut speakers,
+                                &mut kit,
                             ),
                             Err(_) => break,
                         }
                     }
                     recv(en_kick_rx) -> msg => {
                         if msg.is_ok() {
-                            refine_english(
+                            live_preview(
                                 &whisper,
                                 &worker_en_inbox,
                                 &worker_tail,
                                 &ui,
                                 &worker_langs,
-                            );
-                            translate_tail(
-                                &worker_tail,
                                 &mut translator,
-                                &ui,
-                                &mut translated,
-                                &worker_langs,
+                                &mut kit,
                             );
                         } else {
                             drain_english(
@@ -509,32 +504,7 @@ fn run_live_session(
                                 &mt_rx,
                                 Some(&ui),
                                 &worker_langs,
-                                &mut speakers,
-                            );
-                            break;
-                        }
-                    }
-                    recv(ja_kick_rx) -> msg => {
-                        if msg.is_ok() {
-                            transcribe_japanese(
-                                &worker_inbox,
-                                &mut ja_model,
-                                &mut ja_failed,
-                                &haas_dir,
-                                haas_threads,
-                                Some(&ui),
-                                &worker_langs,
-                                &mut speakers,
-                            );
-                        } else {
-                            drain_english(
-                                &mut e2e,
-                                &whisper,
-                                &mut translator,
-                                &mt_rx,
-                                Some(&ui),
-                                &worker_langs,
-                                &mut speakers,
+                                &mut kit,
                             );
                             break;
                         }
@@ -542,48 +512,16 @@ fn run_live_session(
                 }
             }
         } else {
-            loop {
-                select! {
-                    recv(mt_rx) -> job => {
-                        match job {
-                            Ok(job) => record_caption(
-                                &mut e2e,
-                                &whisper,
-                                &mut translator,
-                                job,
-                                None,
-                                &worker_langs,
-                                &mut speakers,
-                            ),
-                            Err(_) => break,
-                        }
-                    }
-                    recv(ja_kick_rx) -> msg => {
-                        if msg.is_ok() {
-                            transcribe_japanese(
-                                &worker_inbox,
-                                &mut ja_model,
-                                &mut ja_failed,
-                                &haas_dir,
-                                haas_threads,
-                                worker_ui.as_ref(),
-                                &worker_langs,
-                                &mut speakers,
-                            );
-                        } else {
-                            drain_english(
-                                &mut e2e,
-                                &whisper,
-                                &mut translator,
-                                &mt_rx,
-                                None,
-                                &worker_langs,
-                                &mut speakers,
-                            );
-                            break;
-                        }
-                    }
-                }
+            while let Ok(job) = mt_rx.recv() {
+                record_caption(
+                    &mut e2e,
+                    &whisper,
+                    &mut translator,
+                    job,
+                    None,
+                    &worker_langs,
+                    &mut kit,
+                );
             }
         }
         let _ = done_tx.send(());
@@ -595,9 +533,8 @@ fn run_live_session(
 
     if show_terminal {
         println!(
-            "Live captions from {label}. Press Ctrl+C to stop. Source {}, target {}.",
-            langs.source().label(),
-            langs.target().label()
+            "Live captions from {label}. Press Ctrl+C to stop. Display {}.",
+            langs.primary().label()
         );
     } else {
         eprintln!("Captions from {label}. Close the window or press Ctrl+C to stop.");
@@ -1117,8 +1054,7 @@ fn pump_live_audio(
     let mut active_out = hear.output();
     mix.set_enabled(active_in, active_out);
     let mut buffer = Vec::new();
-    let mut last_ja_preview = 0_usize;
-    let mut preview_was_ja = false;
+    let mut last_preview = 0_usize;
     let mut strict = true;
     let frame = samples_for_ms(MIX_RATE, CHUNK_MS).max(1);
 
@@ -1160,23 +1096,13 @@ fn pump_live_audio(
         strict = false;
 
         buffer.extend(mix.drain());
-        let hearing_japanese = route.langs.source() == CaptionLang::Ja;
-        engine.set_retain_audio_finals(hearing_japanese);
         while buffer.len() >= frame {
             let samples: Vec<f32> = buffer.drain(..frame).collect();
             let events = engine.push_samples(MIX_RATE, &samples)?;
             *translation_drops += enqueue_finals(mt_tx, events, display, route);
             let split = engine.take_if_long(LIVE_TURN_SECS)?;
             *translation_drops += enqueue_finals(mt_tx, split, display, route);
-            if hearing_japanese != preview_was_ja {
-                last_ja_preview = 0;
-                preview_was_ja = hearing_japanese;
-            }
-            if hearing_japanese {
-                preview_japanese(engine, route, &mut last_ja_preview);
-            } else {
-                preview_english(engine, route, &mut last_ja_preview);
-            }
+            preview_audio(engine, route, &mut last_preview);
         }
     }
 
@@ -1428,50 +1354,23 @@ impl CaptionLang {
 }
 
 struct LangPair {
-    source: AtomicU8,
-    target: AtomicU8,
+    primary: AtomicU8,
 }
 
 impl LangPair {
-    fn parse(source: &str, target: &str) -> Result<Self> {
+    fn parse(primary: &str) -> Result<Self> {
         Ok(Self {
-            source: AtomicU8::new(CaptionLang::parse(source)?.code()),
-            target: AtomicU8::new(CaptionLang::parse(target)?.code()),
+            primary: AtomicU8::new(CaptionLang::parse(primary)?.code()),
         })
     }
 
-    fn source(&self) -> CaptionLang {
-        CaptionLang::from_code(self.source.load(Ordering::Relaxed))
+    fn primary(&self) -> CaptionLang {
+        CaptionLang::from_code(self.primary.load(Ordering::Relaxed))
     }
 
-    fn target(&self) -> CaptionLang {
-        CaptionLang::from_code(self.target.load(Ordering::Relaxed))
+    fn set_primary(&self, primary: CaptionLang) {
+        self.primary.store(primary.code(), Ordering::Relaxed);
     }
-
-    fn set(&self, source: CaptionLang, target: CaptionLang) {
-        self.source.store(source.code(), Ordering::Relaxed);
-        self.target.store(target.code(), Ordering::Relaxed);
-    }
-
-    fn single(&self) -> bool {
-        self.source() == self.target()
-    }
-
-    fn translates(&self) -> bool {
-        self.source() == CaptionLang::En && self.target() == CaptionLang::Ja
-    }
-}
-
-struct JaClip {
-    samples: Vec<f32>,
-    sample_rate: u32,
-    generation: u64,
-    commit: bool,
-}
-
-#[derive(Default)]
-struct JaInbox {
-    clip: Mutex<Option<JaClip>>,
 }
 
 struct EnShot {
@@ -1486,35 +1385,20 @@ struct EnInbox {
 }
 
 struct LiveRoute {
-    langs: Arc<LangPair>,
     ui: Option<Sender<String>>,
     tail: Arc<CaptionTail>,
     en_kick: Option<Sender<()>>,
-    ja_inbox: Arc<JaInbox>,
-    ja_kick: Sender<()>,
     en_inbox: Arc<EnInbox>,
-}
-
-struct RefinedText {
-    rev: u64,
-    text: String,
 }
 
 struct CaptionTail {
     rev: AtomicU64,
-    rough: Mutex<String>,
-    refined: Mutex<RefinedText>,
 }
 
 impl CaptionTail {
     fn new() -> Self {
         Self {
             rev: AtomicU64::new(0),
-            rough: Mutex::new(String::new()),
-            refined: Mutex::new(RefinedText {
-                rev: u64::MAX,
-                text: String::new(),
-            }),
         }
     }
 
@@ -1522,54 +1406,8 @@ impl CaptionTail {
         self.rev.load(Ordering::Acquire)
     }
 
-    fn publish(&self, text: String) -> u64 {
-        if let Ok(mut slot) = self.rough.lock() {
-            *slot = text;
-        }
-        self.rev.load(Ordering::Acquire)
-    }
-
-    /// Keep a rescore only when `rev` is still the open utterance.
-    fn publish_refined(&self, rev: u64, text: String) -> bool {
-        if self.rev.load(Ordering::Acquire) != rev {
-            return false;
-        }
-        let Ok(mut slot) = self.refined.lock() else {
-            return false;
-        };
-        if self.rev.load(Ordering::Acquire) != rev {
-            return false;
-        }
-        *slot = RefinedText { rev, text };
-        true
-    }
-
     fn close_utterance(&self) -> u64 {
-        let closed = self.rev.fetch_add(1, Ordering::Release);
-        if let Ok(mut slot) = self.rough.lock() {
-            slot.clear();
-        }
-        if let Ok(mut slot) = self.refined.lock() {
-            slot.text.clear();
-            slot.rev = u64::MAX;
-        }
-        closed
-    }
-
-    fn snapshot(&self) -> (u64, String) {
-        let rev = self.rev.load(Ordering::Acquire);
-        if let Ok(slot) = self.refined.lock()
-            && slot.rev == rev
-            && !slot.text.is_empty()
-        {
-            return (rev, slot.text.clone());
-        }
-        let text = self
-            .rough
-            .lock()
-            .map(|slot| slot.clone())
-            .unwrap_or_default();
-        (rev, text)
+        self.rev.fetch_add(1, Ordering::Release)
     }
 }
 
@@ -1582,79 +1420,28 @@ fn enqueue_finals(
     let mut drops = 0;
     for event in events {
         match event {
-            AsrEvent::Partial(text) => {
-                if route.langs.source() == CaptionLang::Ja {
-                    continue;
-                }
-                if let Some(ui) = &route.ui {
-                    let rev = route.tail.publish(text.clone());
-                    if route.langs.translates() {
-                        send_caption(
-                            ui,
-                            &serde_json::json!({
-                                "kind": "preview",
-                                "rev": rev,
-                                "english": text,
-                                "single": false,
-                                "rough": true,
-                            }),
-                            false,
-                        );
-                        if let Some(kick) = &route.en_kick {
-                            let _ = kick.try_send(());
-                        }
-                    } else {
-                        send_caption(
-                            ui,
-                            &serde_json::json!({
-                                "kind": "preview",
-                                "rev": rev,
-                                "single": true,
-                                "text": text,
-                                "rough": true,
-                            }),
-                            false,
-                        );
-                    }
-                } else {
-                    display.partial(text);
-                }
-            }
+            // Zipformer text is English-only. Showing it would turn Japanese speech
+            // into an English line and then a nonsense translation.
+            AsrEvent::Partial(_) => {}
             AsrEvent::Final(utterance) => {
-                if route.langs.source() == CaptionLang::Ja {
-                    let generation = route.tail.close_utterance();
-                    if utterance.samples.len() < utterance.sample_rate as usize / 2 {
-                        if let Some(ui) = &route.ui {
-                            send_caption(
-                                ui,
-                                &serde_json::json!({
-                                    "kind": "drop",
-                                    "rev": generation,
-                                }),
-                                true,
-                            );
-                        }
-                        continue;
-                    }
-                    offer_japanese(
-                        &route.ja_inbox,
-                        &route.ja_kick,
-                        JaClip {
-                            samples: utterance.samples,
-                            sample_rate: utterance.sample_rate,
-                            generation,
-                            commit: true,
-                        },
-                    );
-                    continue;
-                }
                 let generation = if route.ui.is_some() {
                     route.tail.close_utterance()
                 } else {
                     display.clear_partial();
                     0
                 };
-                if utterance.text.trim().is_empty() {
+                let min_samples = (utterance.sample_rate as usize) / 2;
+                if utterance.sample_rate == 0 || utterance.samples.len() < min_samples {
+                    if let Some(ui) = &route.ui {
+                        send_caption(
+                            ui,
+                            &serde_json::json!({
+                                "kind": "drop",
+                                "rev": generation,
+                            }),
+                            true,
+                        );
+                    }
                     continue;
                 }
                 let job = TranslationJob {
@@ -1664,19 +1451,15 @@ fn enqueue_finals(
                     utterance_ended: Instant::now(),
                     generation,
                 };
-                if let Err(err) = tx.try_send(job) {
+                if tx.try_send(job).is_err() {
                     drops += 1;
                     if let Some(ui) = &route.ui {
-                        let job = match err {
-                            crossbeam_channel::TrySendError::Full(job)
-                            | crossbeam_channel::TrySendError::Disconnected(job) => job,
-                        };
-                        send_heard(
+                        send_caption(
                             ui,
-                            "commit",
-                            job.generation,
-                            &job.zipformer,
-                            route.langs.single(),
+                            &serde_json::json!({
+                                "kind": "drop",
+                                "rev": generation,
+                            }),
                             true,
                         );
                     }
@@ -1687,8 +1470,8 @@ fn enqueue_finals(
     drops
 }
 
-fn preview_english(engine: &AsrEngine, route: &LiveRoute, last_len: &mut usize) {
-    if route.langs.source() != CaptionLang::En || route.en_kick.is_none() {
+fn preview_audio(engine: &AsrEngine, route: &LiveRoute, last_len: &mut usize) {
+    if route.en_kick.is_none() {
         return;
     }
     let len = engine.utterance_len();
@@ -1714,103 +1497,6 @@ fn preview_english(engine: &AsrEngine, route: &LiveRoute, last_len: &mut usize) 
     if let Some(kick) = &route.en_kick {
         let _ = kick.try_send(());
     }
-}
-
-fn refine_english(
-    whisper: &Option<WhisperRescorer>,
-    inbox: &EnInbox,
-    tail: &CaptionTail,
-    captions: &Sender<String>,
-    langs: &LangPair,
-) {
-    let Some(whisper) = whisper else {
-        return;
-    };
-    for _ in 0..2 {
-        let Some(shot) = inbox.clip.lock().ok().and_then(|mut slot| slot.take()) else {
-            return;
-        };
-        if shot.generation != tail.current() {
-            continue;
-        }
-        let heard = match whisper.transcribe(shot.sample_rate, &shot.samples) {
-            Ok(Some(text)) => text::prepare_english(&text),
-            Ok(None) => None,
-            Err(err) => {
-                tracing::warn!(%err, "live English rescore failed");
-                return;
-            }
-        };
-        let newer = inbox.clip.lock().ok().is_some_and(|slot| slot.is_some());
-        if newer {
-            continue;
-        }
-        let Some(heard) = heard else {
-            return;
-        };
-        if !tail.publish_refined(shot.generation, heard.clone()) {
-            return;
-        }
-        if langs.single() {
-            send_caption(
-                captions,
-                &serde_json::json!({
-                    "kind": "preview",
-                    "rev": shot.generation,
-                    "single": true,
-                    "text": heard,
-                }),
-                false,
-            );
-        } else {
-            send_caption(
-                captions,
-                &serde_json::json!({
-                    "kind": "preview",
-                    "rev": shot.generation,
-                    "single": false,
-                    "english": heard,
-                }),
-                false,
-            );
-        }
-        return;
-    }
-}
-
-fn preview_japanese(engine: &AsrEngine, route: &LiveRoute, last_len: &mut usize) {
-    if route.langs.source() != CaptionLang::Ja {
-        *last_len = 0;
-        return;
-    }
-    let len = engine.utterance_len();
-    if len == 0 {
-        *last_len = 0;
-        return;
-    }
-    let (sample_rate, samples) = engine.snapshot_utterance();
-    let step = sample_rate as usize;
-    if step == 0 || samples.len() < step || samples.len() < last_len.saturating_add(step) {
-        return;
-    }
-    *last_len = samples.len();
-    offer_japanese(
-        &route.ja_inbox,
-        &route.ja_kick,
-        JaClip {
-            samples,
-            sample_rate,
-            generation: route.tail.current(),
-            commit: false,
-        },
-    );
-}
-
-fn offer_japanese(inbox: &JaInbox, kick: &Sender<()>, clip: JaClip) {
-    if let Ok(mut slot) = inbox.clip.lock() {
-        *slot = Some(clip);
-    }
-    let _ = kick.try_send(());
 }
 
 struct SpeakerState {
@@ -1885,147 +1571,44 @@ struct CaptionLine {
     target: String,
 }
 
-fn drain_english(
-    metrics: &mut TranslationMetrics,
-    whisper: &Option<WhisperRescorer>,
-    translator: &mut OnnxMarianTranslator,
-    jobs: &crossbeam_channel::Receiver<TranslationJob>,
-    captions: Option<&Sender<String>>,
-    langs: &LangPair,
-    speakers: &mut SpeakerState,
-) {
-    while let Ok(job) = jobs.recv() {
-        record_caption(metrics, whisper, translator, job, captions, langs, speakers);
-    }
-}
-
-fn record_caption(
-    metrics: &mut TranslationMetrics,
-    whisper: &Option<WhisperRescorer>,
-    translator: &mut OnnxMarianTranslator,
-    job: TranslationJob,
-    captions: Option<&Sender<String>>,
-    langs: &LangPair,
-    speakers: &mut SpeakerState,
-) {
-    match caption_final(whisper, translator, job, captions, langs, speakers) {
-        Ok(Some(elapsed)) => metrics.record(elapsed),
-        Ok(None) => {}
-        Err(err) => tracing::error!(%err, "caption failed"),
-    }
-}
-
-#[derive(Default)]
-struct TailTranslation {
-    rev: u64,
-    text: String,
-    japanese: String,
-}
-
-fn translate_tail(
-    tail: &CaptionTail,
-    translator: &mut OnnxMarianTranslator,
-    captions: &Sender<String>,
-    translated: &mut TailTranslation,
-    langs: &LangPair,
-) {
-    if !langs.translates() {
-        return;
-    }
-    // A few short clauses per wake. The rest waits for the next partial, so a
-    // long line cannot block speaker labeling of the previous turn.
-    for _ in 0..3 {
-        let (rev, full) = tail.snapshot();
-        let full = full.trim().to_string();
-        if full.is_empty() {
-            *translated = TailTranslation::default();
-            return;
-        }
-        if translated.rev != rev {
-            *translated = TailTranslation {
-                rev,
-                text: String::new(),
-                japanese: String::new(),
-            };
-        }
-        match text::next_live_piece(&translated.text, &full) {
-            text::LivePiece::Wait => return,
-            text::LivePiece::Reset => {
-                translated.text.clear();
-                translated.japanese.clear();
-            }
-            text::LivePiece::Ready { covered, piece } => {
-                let japanese = match translator.translate(&piece) {
-                    Ok(japanese) => text::keep_japanese(&japanese).unwrap_or_default(),
-                    Err(err) => {
-                        tracing::warn!(%err, "live caption translation failed");
-                        return;
-                    }
-                };
-                let (now, current) = tail.snapshot();
-                if now != rev {
-                    *translated = TailTranslation {
-                        rev: now,
-                        text: String::new(),
-                        japanese: String::new(),
-                    };
-                    continue;
-                }
-                if !text::hypothesis_extends(&covered, current.trim()) {
-                    translated.text.clear();
-                    translated.japanese.clear();
-                    continue;
-                }
-                if japanese.is_empty() {
-                    translated.text = covered;
-                    continue;
-                }
-                translated.text = covered;
-                if !translated.japanese.is_empty()
-                    && !translated
-                        .japanese
-                        .ends_with(['。', '！', '？', '!', '?', '\n'])
-                {
-                    translated.japanese.push('。');
-                }
-                translated.japanese.push_str(&japanese);
-                send_caption(
-                    captions,
-                    &serde_json::json!({
-                        "kind": "preview",
-                        "rev": rev,
-                        "japanese": translated.japanese,
-                        "single": false,
-                    }),
-                    false,
-                );
-            }
-        }
-    }
-}
-
-fn transcribe_japanese(
-    inbox: &JaInbox,
-    model: &mut Option<HaasRecognizer>,
-    failed: &mut bool,
-    model_dir: &std::path::Path,
+struct RecognizeKit {
+    haas_dir: PathBuf,
     threads: i32,
-    captions: Option<&Sender<String>>,
-    langs: &LangPair,
-    speakers: &mut SpeakerState,
-) {
-    loop {
-        let Some(clip) = inbox.clip.lock().ok().and_then(|mut slot| slot.take()) else {
-            return;
-        };
-        if *failed {
-            continue;
+    japanese: Option<HaasRecognizer>,
+    japanese_failed: bool,
+    ja_en: JaEnModel,
+    language: LanguageState,
+    speakers: SpeakerState,
+}
+
+impl RecognizeKit {
+    fn new(
+        haas_dir: PathBuf,
+        lid_dir: PathBuf,
+        ja_en_dir: PathBuf,
+        diar_dir: PathBuf,
+        threads: i32,
+    ) -> Self {
+        Self {
+            haas_dir,
+            threads,
+            japanese: None,
+            japanese_failed: false,
+            ja_en: JaEnModel::new(ja_en_dir),
+            language: LanguageState::new(lid_dir, threads),
+            speakers: SpeakerState::new(diar_dir, threads),
         }
-        if model.is_none() {
-            match HaasRecognizer::from_dir(model_dir, threads) {
-                Ok(recognizer) => *model = Some(recognizer),
+    }
+
+    fn japanese_model(&mut self, captions: Option<&Sender<String>>) -> Option<&HaasRecognizer> {
+        if self.japanese_failed {
+            return None;
+        }
+        if self.japanese.is_none() {
+            match HaasRecognizer::from_dir(&self.haas_dir, self.threads) {
+                Ok(model) => self.japanese = Some(model),
                 Err(err) => {
-                    *failed = true;
+                    self.japanese_failed = true;
                     tracing::warn!(%err, "Haas Japanese recognizer unavailable");
                     if let Some(tx) = captions {
                         send_caption(
@@ -2037,80 +1620,400 @@ fn transcribe_japanese(
                             true,
                         );
                     }
-                    continue;
+                    return None;
                 }
             }
         }
-        let Some(recognizer) = model.as_ref() else {
+        self.japanese.as_ref()
+    }
+}
+
+struct LanguageState {
+    dir: PathBuf,
+    threads: i32,
+    model: Option<lid::LanguageId>,
+    failed: bool,
+}
+
+impl LanguageState {
+    fn new(dir: PathBuf, threads: i32) -> Self {
+        Self {
+            dir,
+            threads,
+            model: None,
+            failed: false,
+        }
+    }
+
+    fn detect(
+        &mut self,
+        captions: Option<&Sender<String>>,
+        sample_rate: u32,
+        samples: &[f32],
+    ) -> Detected {
+        if self.failed || sample_rate == 0 || samples.len() < sample_rate as usize * 4 / 5 {
+            return Detected::Unknown;
+        }
+        if self.model.is_none() {
+            match lid::LanguageId::open(&self.dir, self.threads) {
+                Ok(model) => self.model = Some(model),
+                Err(err) => {
+                    self.failed = true;
+                    tracing::warn!(%err, "language identification unavailable");
+                    if let Some(tx) = captions {
+                        send_caption(
+                            tx,
+                            &serde_json::json!({
+                                "kind": "status",
+                                "message": "言語判定のモデルがありません。scripts/download-asr.sh を実行してください。",
+                            }),
+                            true,
+                        );
+                    }
+                    return Detected::Unknown;
+                }
+            }
+        }
+        let Some(model) = self.model.as_ref() else {
+            return Detected::Unknown;
+        };
+        match model.identify(sample_rate, samples) {
+            Ok(lid::Heard::En) => Detected::En,
+            Ok(lid::Heard::Ja) => Detected::Ja,
+            Ok(lid::Heard::Other) => Detected::Other,
+            Err(err) => {
+                tracing::warn!(%err, "language identification failed");
+                Detected::Unknown
+            }
+        }
+    }
+}
+
+enum Detected {
+    En,
+    Ja,
+    Other,
+    Unknown,
+}
+
+fn spoken_of(detected: Detected, primary: CaptionLang) -> Option<CaptionLang> {
+    match detected {
+        Detected::En => Some(CaptionLang::En),
+        Detected::Ja => Some(CaptionLang::Ja),
+        Detected::Unknown => Some(primary),
+        Detected::Other => None,
+    }
+}
+
+struct JaEnModel {
+    dir: PathBuf,
+    model: Option<OnnxMarianTranslator>,
+    failed: bool,
+}
+
+impl JaEnModel {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            model: None,
+            failed: false,
+        }
+    }
+
+    fn translate(&mut self, text: &str, captions: Option<&Sender<String>>) -> String {
+        if self.failed || text.trim().is_empty() {
+            return String::new();
+        }
+        if self.model.is_none() {
+            match OnnxMarianTranslator::from_dir(&self.dir) {
+                Ok(model) => self.model = Some(model),
+                Err(err) => {
+                    self.failed = true;
+                    tracing::warn!(%err, "Japanese-to-English model unavailable");
+                    if let Some(tx) = captions {
+                        send_caption(
+                            tx,
+                            &serde_json::json!({
+                                "kind": "status",
+                                "message": "日本語から英語の翻訳モデルがありません。scripts/export-marian-onnx.sh で書き出してください。",
+                            }),
+                            true,
+                        );
+                    }
+                    return String::new();
+                }
+            }
+        }
+        let Some(model) = self.model.as_mut() else {
+            return String::new();
+        };
+        let mut combined = String::new();
+        for piece in japanese_pieces(text) {
+            match model.translate_into(&piece, false) {
+                Ok(english) => {
+                    let english = english.trim();
+                    if english.is_empty() {
+                        continue;
+                    }
+                    if !combined.is_empty() {
+                        combined.push(' ');
+                    }
+                    combined.push_str(english);
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "Japanese-to-English translation failed");
+                    break;
+                }
+            }
+        }
+        combined
+    }
+}
+
+fn japanese_pieces(text: &str) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if matches!(ch, '。' | '！' | '？' | '!' | '?') {
+            let piece = current.trim().to_string();
+            if !piece.is_empty() {
+                pieces.push(piece);
+            }
+            current.clear();
+        }
+    }
+    let rest = current.trim().to_string();
+    if !rest.is_empty() {
+        pieces.push(rest);
+    }
+    pieces
+}
+
+fn drain_english(
+    metrics: &mut TranslationMetrics,
+    whisper: &Option<WhisperRescorer>,
+    translator: &mut OnnxMarianTranslator,
+    jobs: &crossbeam_channel::Receiver<TranslationJob>,
+    captions: Option<&Sender<String>>,
+    langs: &LangPair,
+    kit: &mut RecognizeKit,
+) {
+    while let Ok(job) = jobs.recv() {
+        record_caption(metrics, whisper, translator, job, captions, langs, kit);
+    }
+}
+
+fn record_caption(
+    metrics: &mut TranslationMetrics,
+    whisper: &Option<WhisperRescorer>,
+    translator: &mut OnnxMarianTranslator,
+    job: TranslationJob,
+    captions: Option<&Sender<String>>,
+    langs: &LangPair,
+    kit: &mut RecognizeKit,
+) {
+    match caption_final(whisper, translator, job, captions, langs, kit) {
+        Ok(Some(elapsed)) => metrics.record(elapsed),
+        Ok(None) => {}
+        Err(err) => tracing::error!(%err, "caption failed"),
+    }
+}
+
+fn live_preview(
+    english: &Option<WhisperRescorer>,
+    inbox: &EnInbox,
+    tail: &CaptionTail,
+    captions: &Sender<String>,
+    langs: &LangPair,
+    translator: &mut OnnxMarianTranslator,
+    kit: &mut RecognizeKit,
+) {
+    let primary = langs.primary();
+    for _ in 0..2 {
+        let Some(shot) = inbox.clip.lock().ok().and_then(|mut slot| slot.take()) else {
             return;
         };
-        if clip.commit {
-            let mut turns = speakers.segment(captions, clip.sample_rate, &clip.samples);
-            let mut lines = if diar::has_multiple(&turns) {
-                japanese_slices(
-                    recognizer,
-                    speakers,
-                    clip.sample_rate,
-                    &clip.samples,
-                    &mut turns,
-                )
-            } else {
-                Vec::new()
-            };
-            if lines.is_empty()
-                && let Some(heard) = heard_japanese(recognizer, clip.sample_rate, &clip.samples)
-            {
-                lines.push(CaptionLine {
-                    speaker: speakers.label_longest(&mut turns),
-                    source: heard,
-                    target: String::new(),
-                });
-            }
-            if inbox.clip.lock().ok().is_some_and(|slot| slot.is_some()) {
-                continue;
-            }
-            if lines.is_empty() {
-                drop_caption(captions, clip.generation);
-                return;
-            }
-            emit_lines(captions, clip.generation, langs, &lines);
-            return;
+        if shot.generation != tail.current() {
+            continue;
         }
-        let heard = heard_japanese(recognizer, clip.sample_rate, &clip.samples);
+        let detected = kit
+            .language
+            .detect(Some(captions), shot.sample_rate, &shot.samples);
+        let Some(spoken) = spoken_of(detected, primary) else {
+            return;
+        };
+        let Some(text) = transcribe_spoken(
+            english,
+            kit,
+            spoken,
+            shot.sample_rate,
+            &shot.samples,
+            None,
+            Some(captions),
+        ) else {
+            return;
+        };
         if inbox.clip.lock().ok().is_some_and(|slot| slot.is_some()) {
             continue;
         }
-        let Some(heard) = heard else {
+        if shot.generation != tail.current() {
             return;
-        };
-        if let Some(tx) = captions {
-            if langs.single() {
-                send_caption(
-                    tx,
-                    &serde_json::json!({
-                        "kind": "preview",
-                        "rev": clip.generation,
-                        "single": true,
-                        "text": heard,
-                    }),
-                    false,
-                );
-            } else {
-                send_caption(
-                    tx,
-                    &serde_json::json!({
-                        "kind": "preview",
-                        "rev": clip.generation,
-                        "single": false,
-                        "source": heard,
-                    }),
-                    false,
-                );
-            }
-        } else {
-            println!("{heard}");
-            let _ = io::stdout().flush();
         }
+        let target = into_primary(translator, kit, spoken, primary, &text, Some(captions));
+        send_lines(
+            Some(captions),
+            "preview",
+            shot.generation,
+            &[CaptionLine {
+                speaker: 0,
+                source: text,
+                target,
+            }],
+            false,
+        );
+        return;
+    }
+}
+
+fn caption_final(
+    english: &Option<WhisperRescorer>,
+    translator: &mut OnnxMarianTranslator,
+    job: TranslationJob,
+    captions: Option<&Sender<String>>,
+    langs: &LangPair,
+    kit: &mut RecognizeKit,
+) -> Result<Option<Duration>> {
+    let primary = langs.primary();
+    let mut turns = kit
+        .speakers
+        .segment(captions, job.sample_rate, &job.samples);
+    let mut pending = Vec::new();
+    if diar::has_multiple(&turns) {
+        for (index, turn) in turns.iter().enumerate() {
+            let audio = diar::slice_turn(job.sample_rate, &job.samples, turn);
+            let detected = kit.language.detect(captions, job.sample_rate, &audio);
+            let Some(spoken) = spoken_of(detected, primary) else {
+                continue;
+            };
+            let Some(text) = transcribe_spoken(
+                english,
+                kit,
+                spoken,
+                job.sample_rate,
+                &audio,
+                None,
+                captions,
+            ) else {
+                continue;
+            };
+            let target = into_primary(translator, kit, spoken, primary, &text, captions);
+            pending.push((index, text, target));
+        }
+    }
+    let mut lines = Vec::new();
+    for (index, text, target) in pending {
+        let speaker = kit.speakers.label(&mut turns[index]);
+        lines.push(CaptionLine {
+            speaker,
+            source: text,
+            target,
+        });
+    }
+    if lines.is_empty() {
+        let detected = kit.language.detect(captions, job.sample_rate, &job.samples);
+        if let Some(spoken) = spoken_of(detected, primary)
+            && let Some(text) = transcribe_spoken(
+                english,
+                kit,
+                spoken,
+                job.sample_rate,
+                &job.samples,
+                Some(job.zipformer.as_str()),
+                captions,
+            )
+        {
+            let target = into_primary(translator, kit, spoken, primary, &text, captions);
+            let speaker = kit.speakers.label_longest(&mut turns);
+            lines.push(CaptionLine {
+                speaker,
+                source: text,
+                target,
+            });
+        }
+    }
+    if lines.is_empty() {
+        tracing::debug!(zipformer = %job.zipformer, "skipped utterance");
+        drop_caption(captions, job.generation);
+        return Ok(None);
+    }
+    let elapsed = job.utterance_ended.elapsed();
+    send_lines(captions, "commit", job.generation, &lines, true);
+    Ok(Some(elapsed))
+}
+
+fn transcribe_spoken(
+    english: &Option<WhisperRescorer>,
+    kit: &mut RecognizeKit,
+    spoken: CaptionLang,
+    sample_rate: u32,
+    samples: &[f32],
+    zipformer: Option<&str>,
+    captions: Option<&Sender<String>>,
+) -> Option<String> {
+    match spoken {
+        CaptionLang::Ja => {
+            let recognizer = kit.japanese_model(captions)?;
+            heard_japanese(recognizer, sample_rate, samples)
+        }
+        CaptionLang::En => {
+            if let Some(model) = english {
+                match model.transcribe(sample_rate, samples) {
+                    Ok(Some(text)) => {
+                        if let Some(text) = text::prepare_english(&text) {
+                            return Some(text);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!(%err, "English recognition failed"),
+                }
+            }
+            zipformer.and_then(text::prepare_english)
+        }
+    }
+}
+
+fn into_primary(
+    translator: &mut OnnxMarianTranslator,
+    kit: &mut RecognizeKit,
+    spoken: CaptionLang,
+    primary: CaptionLang,
+    text: &str,
+    captions: Option<&Sender<String>>,
+) -> String {
+    if spoken == primary || text.trim().is_empty() {
+        return String::new();
+    }
+    match (spoken, primary) {
+        (CaptionLang::En, CaptionLang::Ja) => {
+            let mut combined = String::new();
+            for piece in text::english_pieces(text, 16) {
+                match translator.translate(&piece) {
+                    Ok(japanese) => {
+                        if let Some(part) = text::keep_japanese(&japanese) {
+                            combined.push_str(&part);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "English-to-Japanese translation failed");
+                        break;
+                    }
+                }
+            }
+            combined
+        }
+        (CaptionLang::Ja, CaptionLang::En) => kit.ja_en.translate(text, captions),
+        _ => String::new(),
     }
 }
 
@@ -2128,144 +2031,6 @@ fn heard_japanese(
     }
 }
 
-fn japanese_slices(
-    recognizer: &HaasRecognizer,
-    speakers: &mut SpeakerState,
-    sample_rate: u32,
-    samples: &[f32],
-    turns: &mut [diar::SpeechTurn],
-) -> Vec<CaptionLine> {
-    let mut lines = Vec::new();
-    for turn in turns {
-        let audio = diar::slice_turn(sample_rate, samples, turn);
-        let Some(heard) = heard_japanese(recognizer, sample_rate, &audio) else {
-            continue;
-        };
-        lines.push(CaptionLine {
-            speaker: speakers.label(turn),
-            source: heard,
-            target: String::new(),
-        });
-    }
-    lines
-}
-
-fn send_heard(tx: &Sender<String>, kind: &str, rev: u64, text: &str, single: bool, reliable: bool) {
-    if single {
-        send_caption(
-            tx,
-            &serde_json::json!({
-                "kind": kind,
-                "rev": rev,
-                "single": true,
-                "text": text,
-            }),
-            reliable,
-        );
-    } else {
-        send_caption(
-            tx,
-            &serde_json::json!({
-                "kind": kind,
-                "rev": rev,
-                "single": false,
-                "english": text,
-            }),
-            reliable,
-        );
-    }
-}
-
-fn caption_final(
-    whisper: &Option<WhisperRescorer>,
-    translator: &mut OnnxMarianTranslator,
-    job: TranslationJob,
-    captions: Option<&Sender<String>>,
-    langs: &LangPair,
-    speakers: &mut SpeakerState,
-) -> Result<Option<Duration>> {
-    let mut turns = speakers.segment(captions, job.sample_rate, &job.samples);
-    let mut lines = Vec::new();
-    if diar::has_multiple(&turns)
-        && let Some(whisper) = whisper
-    {
-        lines = english_slices(whisper, translator, &job, &mut turns, langs, speakers);
-    }
-    if lines.is_empty() {
-        let english = rescore_english(whisper, &job)?;
-        let Some(english) = text::prepare_english(&english) else {
-            tracing::debug!(zipformer = %job.zipformer, "skipped junk English");
-            drop_caption(captions, job.generation);
-            return Ok(None);
-        };
-        let japanese = translate_line(translator, langs, &english)?;
-        lines.push(CaptionLine {
-            speaker: speakers.label_longest(&mut turns),
-            source: english,
-            target: japanese,
-        });
-    }
-    let elapsed = job.utterance_ended.elapsed();
-    emit_lines(captions, job.generation, langs, &lines);
-    Ok(Some(elapsed))
-}
-
-fn english_slices(
-    whisper: &WhisperRescorer,
-    translator: &mut OnnxMarianTranslator,
-    job: &TranslationJob,
-    turns: &mut [diar::SpeechTurn],
-    langs: &LangPair,
-    speakers: &mut SpeakerState,
-) -> Vec<CaptionLine> {
-    let mut lines = Vec::new();
-    for turn in turns {
-        let audio = diar::slice_turn(job.sample_rate, &job.samples, turn);
-        let raw = match whisper.transcribe(job.sample_rate, &audio) {
-            Ok(Some(text)) => text,
-            Ok(None) => continue,
-            Err(err) => {
-                tracing::warn!(%err, "speaker slice rescore failed");
-                continue;
-            }
-        };
-        let Some(english) = text::prepare_english(&raw) else {
-            continue;
-        };
-        let japanese = match translate_line(translator, langs, &english) {
-            Ok(text) => text,
-            Err(err) => {
-                tracing::warn!(%err, "speaker slice translation failed");
-                String::new()
-            }
-        };
-        lines.push(CaptionLine {
-            speaker: speakers.label(turn),
-            source: english,
-            target: japanese,
-        });
-    }
-    lines
-}
-
-fn translate_line(
-    translator: &mut OnnxMarianTranslator,
-    langs: &LangPair,
-    english: &str,
-) -> Result<String> {
-    if !langs.translates() {
-        return Ok(String::new());
-    }
-    let mut combined = String::new();
-    for piece in text::english_pieces(english, 16) {
-        let japanese = translator.translate(&piece)?;
-        if let Some(part) = text::keep_japanese(&japanese) {
-            combined.push_str(&part);
-        }
-    }
-    Ok(combined)
-}
-
 fn drop_caption(captions: Option<&Sender<String>>, rev: u64) {
     if let Some(tx) = captions {
         send_caption(
@@ -2279,15 +2044,16 @@ fn drop_caption(captions: Option<&Sender<String>>, rev: u64) {
     }
 }
 
-fn emit_lines(
+fn send_lines(
     captions: Option<&Sender<String>>,
+    kind: &str,
     rev: u64,
-    langs: &LangPair,
     lines: &[CaptionLine],
+    reliable: bool,
 ) {
     let Some(tx) = captions else {
         for line in lines {
-            print_line(langs, line);
+            print_line(line);
         }
         let _ = io::stdout().flush();
         return;
@@ -2296,44 +2062,33 @@ fn emit_lines(
         drop_caption(Some(tx), rev);
         return;
     }
+    let translated = lines.iter().any(|line| !line.target.is_empty());
     let labeled = lines.len() > 1 || lines.iter().any(|line| line.speaker > 0);
+    if !labeled && !translated {
+        send_caption(
+            tx,
+            &serde_json::json!({
+                "kind": kind,
+                "rev": rev,
+                "single": true,
+                "text": lines[0].source,
+            }),
+            reliable,
+        );
+        return;
+    }
     if !labeled {
-        let line = &lines[0];
-        if langs.single() {
-            send_caption(
-                tx,
-                &serde_json::json!({
-                    "kind": "commit",
-                    "rev": rev,
-                    "single": true,
-                    "text": line.source,
-                }),
-                true,
-            );
-        } else if langs.source() == CaptionLang::En {
-            send_caption(
-                tx,
-                &serde_json::json!({
-                    "kind": "commit",
-                    "rev": rev,
-                    "english": line.source,
-                    "japanese": line.target,
-                    "single": false,
-                }),
-                true,
-            );
-        } else {
-            send_caption(
-                tx,
-                &serde_json::json!({
-                    "kind": "commit",
-                    "rev": rev,
-                    "single": false,
-                    "source": line.source,
-                }),
-                true,
-            );
-        }
+        send_caption(
+            tx,
+            &serde_json::json!({
+                "kind": kind,
+                "rev": rev,
+                "single": false,
+                "source": lines[0].source,
+                "target": lines[0].target,
+            }),
+            reliable,
+        );
         return;
     }
     let turns: Vec<_> = lines
@@ -2349,28 +2104,24 @@ fn emit_lines(
     send_caption(
         tx,
         &serde_json::json!({
-            "kind": "commit",
+            "kind": kind,
             "rev": rev,
-            "single": langs.single(),
+            "single": !translated,
             "turns": turns,
         }),
-        true,
+        reliable,
     );
 }
 
-fn print_line(langs: &LangPair, line: &CaptionLine) {
+fn print_line(line: &CaptionLine) {
     let who = if line.speaker > 0 {
         format!("話者{} ", line.speaker)
     } else {
         String::new()
     };
-    if langs.single() || langs.source() != CaptionLang::En {
-        println!("{who}{}", line.source);
-        return;
-    }
-    println!("{who}EN: {}", line.source);
+    println!("{who}{}", line.source);
     if !line.target.is_empty() {
-        println!("{who}JA: {}", line.target);
+        println!("{who}{}", line.target);
     }
 }
 

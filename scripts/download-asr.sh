@@ -167,9 +167,73 @@ download_distil_small() {
   echo "Distil-small English ready at ${target}"
 }
 
+download_parakeet() {
+  local archive="sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2"
+  local extracted="sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+  local target="${DEST}/parakeet-en"
+  local encoder="${target}/encoder.int8.onnx"
+
+  if [[ -f "${encoder}" && -f "${target}/decoder.int8.onnx" && -f "${target}/joiner.int8.onnx" && -f "${target}/tokens.txt" ]]; then
+    echo "Parakeet already present at ${target}"
+    return 0
+  fi
+
+  echo "Downloading ${RELEASE}/${archive}"
+  curl -L --fail --retry 3 -o "${DEST}/${archive}" "${RELEASE}/${archive}"
+  tar -xjf "${DEST}/${archive}" -C "${DEST}"
+  rm -f "${DEST}/${archive}"
+
+  if [[ -d "${DEST}/${extracted}" ]]; then
+    rm -rf "${target}"
+    mv "${DEST}/${extracted}" "${target}"
+  fi
+
+  if [[ ! -f "${encoder}" ]]; then
+    echo "expected Parakeet encoder missing after extract: ${encoder}" >&2
+    ls -la "${target}" >&2 || true
+    exit 1
+  fi
+
+  echo "Parakeet ready at ${target}"
+}
+
+download_lid() {
+  local archive="sherpa-onnx-whisper-tiny.tar.bz2"
+  local extracted="sherpa-onnx-whisper-tiny"
+  local target="${DEST}/whisper-tiny"
+  local encoder="${target}/tiny-encoder.int8.onnx"
+
+  if [[ -f "${encoder}" && -f "${target}/tiny-decoder.int8.onnx" ]]; then
+    echo "Language id model already present at ${target}"
+    return 0
+  fi
+
+  echo "Downloading ${RELEASE}/${archive}"
+  curl -L --fail --retry 3 -o "${DEST}/${archive}" "${RELEASE}/${archive}"
+  tar -xjf "${DEST}/${archive}" -C "${DEST}"
+  rm -f "${DEST}/${archive}"
+
+  if [[ -d "${DEST}/${extracted}" ]]; then
+    rm -rf "${target}"
+    mv "${DEST}/${extracted}" "${target}"
+  fi
+  rm -rf "${target}/test_wavs"
+  rm -f "${target}/tiny-encoder.onnx" "${target}/tiny-decoder.onnx"
+
+  if [[ ! -f "${encoder}" ]]; then
+    echo "expected language id encoder missing after extract: ${encoder}" >&2
+    ls -la "${target}" >&2 || true
+    exit 1
+  fi
+
+  echo "Language id model ready at ${target}"
+}
+
 download_zipformer
 download_vad
 download_whisper
+download_parakeet
+download_lid
 download_distil_small
 download_haas
 download_diar

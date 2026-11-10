@@ -13,10 +13,16 @@ use sherpa_onnx::{
     SpeakerEmbeddingExtractorConfig,
 };
 
-/// Same-speaker match. Higher means a stricter identity.
-const MATCH_COSINE: f32 = 0.55;
+/// Confident same-speaker match. A weaker score still reuses the nearest voice.
+const MATCH_COSINE: f32 = 0.50;
+/// Only a clearly different, long enough voice opens a new speaker id.
+const NEW_SPEAKER_COSINE: f32 = 0.38;
+const MIN_NEW_SECS: f32 = 1.5;
 /// Ignore blips shorter than the recognizers will transcribe.
 const MIN_TURN_SECS: f32 = 0.5;
+/// A second voice below this length, or this share of the clip, stays one speaker.
+const MIN_OTHER_SECS: f32 = 1.0;
+const MIN_OTHER_SHARE: f32 = 0.30;
 /// Join adjacent slices from the same person when the gap is only a breath.
 const MERGE_GAP_SECS: f32 = 0.35;
 const MAX_SPEAKERS: usize = 12;
@@ -37,7 +43,8 @@ pub struct SpeechTurn {
 impl SpeechTurn {
     /// Remember this voice and return its session id. Calling it again returns 0.
     pub fn label(&mut self, book: &mut SpeakerBook) -> u32 {
-        book.assign(self.embedding.take().unwrap_or_default())
+        let seconds = self.duration();
+        book.assign(self.embedding.take().unwrap_or_default(), seconds)
     }
 }
 
@@ -60,7 +67,7 @@ struct Enrolled {
 }
 
 impl SpeakerBook {
-    fn assign(&mut self, embedding: Vec<f32>) -> u32 {
+    fn assign(&mut self, embedding: Vec<f32>, seconds: f32) -> u32 {
         let Some(embedding) = unit(embedding) else {
             return 0;
         };
@@ -76,30 +83,33 @@ impl SpeakerBook {
             }
         }
         if best >= MATCH_COSINE && best_id != 0 {
-            if let Some(speaker) = self
-                .speakers
-                .iter_mut()
-                .find(|speaker| speaker.id == best_id)
+            if best >= 0.62
+                && let Some(speaker) = self
+                    .speakers
+                    .iter_mut()
+                    .find(|speaker| speaker.id == best_id)
                 && speaker.embeds.len() < MAX_EMBEDDINGS
             {
                 speaker.embeds.push(embedding);
             }
             return best_id;
         }
-        if self.speakers.len() >= MAX_SPEAKERS {
-            return if best_id == 0 {
-                self.speakers.first().map(|speaker| speaker.id).unwrap_or(0)
-            } else {
-                best_id
-            };
+        let open = self.speakers.len() < MAX_SPEAKERS
+            && seconds >= MIN_NEW_SECS
+            && (self.speakers.is_empty() || best < NEW_SPEAKER_COSINE);
+        if open {
+            self.next += 1;
+            let id = self.next;
+            self.speakers.push(Enrolled {
+                id,
+                embeds: vec![embedding],
+            });
+            return id;
         }
-        self.next += 1;
-        let id = self.next;
-        self.speakers.push(Enrolled {
-            id,
-            embeds: vec![embedding],
-        });
-        id
+        if best_id != 0 {
+            return best_id;
+        }
+        self.speakers.first().map(|speaker| speaker.id).unwrap_or(0)
     }
 }
 
@@ -208,7 +218,7 @@ impl Diarizer {
             return self.whole_clip(&audio, model_rate);
         }
 
-        let mut longest: HashMap<i32, (f32, usize, usize)> = HashMap::new();
+        let mut grouped: HashMap<i32, (f32, f32, usize, usize)> = HashMap::new();
         for segment in &segments {
             let duration = segment.end - segment.start;
             if duration < MIN_TURN_SECS {
@@ -216,25 +226,34 @@ impl Diarizer {
             }
             let start = secs_to_index(segment.start, model_rate as u32, audio.len());
             let end = secs_to_index(segment.end, model_rate as u32, audio.len());
-            let entry = longest.entry(segment.speaker).or_insert((0.0, start, end));
-            if duration > entry.0 {
-                *entry = (duration, start, end);
+            let entry = grouped
+                .entry(segment.speaker)
+                .or_insert((0.0, 0.0, start, end));
+            entry.0 += duration;
+            if duration > entry.1 {
+                *entry = (entry.0, duration, start, end);
             }
+        }
+        let totals: Vec<f32> = grouped.values().map(|(total, _, _, _)| *total).collect();
+        if single_voice(&totals) {
+            return self.whole_clip(&audio, model_rate);
         }
 
         let mut embeddings = HashMap::new();
-        for (local, (_, start, end)) in longest {
-            if end <= start {
+        for (local, (total, _, start, end)) in &grouped {
+            if *total < MIN_OTHER_SECS || end <= start {
                 continue;
             }
-            if let Some(embedding) = self.embed(&audio[start..end], model_rate) {
-                embeddings.insert(local, embedding);
+            if let Some(embedding) = self.embed_window(&audio[*start..*end], model_rate) {
+                embeddings.insert(*local, embedding);
             }
         }
 
         let mut turns: Vec<SpeechTurn> = Vec::new();
         for segment in segments {
-            if segment.end - segment.start < MIN_TURN_SECS {
+            if segment.end - segment.start < MIN_TURN_SECS
+                || !embeddings.contains_key(&segment.speaker)
+            {
                 continue;
             }
             if let Some(last) = turns.last_mut()
@@ -259,7 +278,7 @@ impl Diarizer {
     }
 
     fn whole_clip(&self, audio: &[f32], sample_rate: i32) -> Vec<SpeechTurn> {
-        let Some(embedding) = self.embed(audio, sample_rate) else {
+        let Some(embedding) = self.embed_window(audio, sample_rate) else {
             return Vec::new();
         };
         vec![SpeechTurn {
@@ -268,6 +287,21 @@ impl Diarizer {
             start: 0.0,
             end: audio.len() as f32 / sample_rate as f32,
         }]
+    }
+
+    fn embed_window(&self, samples: &[f32], sample_rate: i32) -> Option<Vec<f32>> {
+        if sample_rate <= 0 {
+            return None;
+        }
+        let max = (sample_rate as usize).saturating_mul(6);
+        if max == 0 || samples.is_empty() {
+            return None;
+        }
+        if samples.len() <= max {
+            return self.embed(samples, sample_rate);
+        }
+        let start = (samples.len() - max) / 2;
+        self.embed(&samples[start..start + max], sample_rate)
     }
 
     fn embed(&self, samples: &[f32], sample_rate: i32) -> Option<Vec<f32>> {
@@ -344,6 +378,22 @@ fn unit(embedding: Vec<f32>) -> Option<Vec<f32>> {
     Some(embedding.into_iter().map(|value| value / norm).collect())
 }
 
+/// True when a second voice is too short to treat the clip as a conversation.
+fn single_voice(totals: &[f32]) -> bool {
+    let mut kept: Vec<f32> = totals
+        .iter()
+        .copied()
+        .filter(|secs| *secs >= MIN_TURN_SECS)
+        .collect();
+    if kept.len() <= 1 {
+        return true;
+    }
+    kept.sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
+    let second = kept[1];
+    let total: f32 = kept.iter().sum();
+    second < MIN_OTHER_SECS || total <= 0.0 || second / total < MIN_OTHER_SHARE
+}
+
 fn dot(left: &[f32], right: &[f32]) -> f32 {
     if left.len() != right.len() {
         return f32::MIN;
@@ -366,13 +416,13 @@ mod tests {
     #[test]
     fn book_reuses_a_voice_and_caps_growth() {
         let mut book = SpeakerBook::default();
-        let first = book.assign(vec![1.0, 0.0, 0.0]);
-        let again = book.assign(vec![0.9, 0.1, 0.0]);
+        let first = book.assign(vec![1.0, 0.0, 0.0], 2.0);
+        let again = book.assign(vec![0.9, 0.1, 0.0], 2.0);
         assert_eq!(first, 1);
         assert_eq!(again, first);
-        let second = book.assign(vec![0.0, 1.0, 0.0]);
+        let second = book.assign(vec![0.0, 1.0, 0.0], 2.0);
         assert_eq!(second, 2);
-        assert_eq!(book.assign(vec![0.0, 0.0, 0.0]), 0);
+        assert_eq!(book.assign(vec![0.0, 0.0, 0.0], 2.0), 0);
     }
 
     #[test]
@@ -381,13 +431,25 @@ mod tests {
         for index in 0..MAX_SPEAKERS {
             let mut embedding = vec![0.0; MAX_SPEAKERS];
             embedding[index] = 1.0;
-            assert_eq!(book.assign(embedding), (index as u32) + 1);
+            assert_eq!(book.assign(embedding, 2.0), (index as u32) + 1);
         }
         let mut extra = vec![0.0; MAX_SPEAKERS];
         extra.push(1.0);
-        let assigned = book.assign(extra);
+        let assigned = book.assign(extra, 2.0);
         assert!(assigned >= 1 && assigned <= MAX_SPEAKERS as u32);
         assert_eq!(book.speakers.len(), MAX_SPEAKERS);
+    }
+
+    #[test]
+    fn short_different_voice_stays_with_the_current_speaker() {
+        let mut book = SpeakerBook::default();
+        let first = book.assign(vec![1.0, 0.0], 2.0);
+        let brief = book.assign(vec![0.0, 1.0], 0.6);
+        assert_eq!(brief, first);
+        assert_eq!(book.speakers.len(), 1);
+        assert!(single_voice(&[5.0, 0.4]));
+        assert!(single_voice(&[4.0, 0.8]));
+        assert!(!single_voice(&[3.0, 2.0]));
     }
 
     #[test]

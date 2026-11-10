@@ -80,9 +80,10 @@
         padding: 0 6px;
       }
 
-      .langs .arrow {
+      .langs .lang-label {
         color: var(--ink-faint);
         font-size: 12px;
+        font-weight: 600;
       }
 
       .hear {
@@ -263,14 +264,10 @@
         </div>
         <div class="spacer"></div>
         <div class="langs">
-          <select id="source" aria-label="入力言語">
-            <option value="en" selected>英語</option>
-            <option value="ja">日本語</option>
-          </select>
-          <span class="arrow" aria-hidden="true">→</span>
-          <select id="target" aria-label="翻訳言語">
-            <option value="en">英語</option>
+          <span class="lang-label">表示</span>
+          <select id="primary" aria-label="表示言語">
             <option value="ja" selected>日本語</option>
+            <option value="en">英語</option>
           </select>
         </div>
         <button class="clear" id="clear" type="button" disabled>クリア</button>
@@ -360,8 +357,7 @@
         post("drag");
       });
 
-      var sourceLang = document.getElementById("source");
-      var targetLang = document.getElementById("target");
+      var primaryLang = document.getElementById("primary");
       var note = document.getElementById("note");
       var hearInput = document.getElementById("hear-input");
       var hearOutput = document.getElementById("hear-output");
@@ -409,19 +405,35 @@
         refreshHearNote();
       };
 
-      function sameLanguage() {
-        return sourceLang.value === targetLang.value;
+      function anyTranslated() {
+        var keys = Object.keys(rows);
+        for (var i = 0; i < keys.length; i++) {
+          if (!rows[keys[i]].single) {
+            return true;
+          }
+        }
+        return false;
       }
 
-      function langLabel(code) {
-        return code === "ja" ? "日本語" : "英語";
+      function rowsInOrder() {
+        return Object.keys(rows)
+          .sort(function (a, b) {
+            return Number(a) - Number(b);
+          })
+          .map(function (key) {
+            return rows[key];
+          });
       }
 
-      function columnText(lane) {
+      function cellText(node) {
+        return node.textContent.replace(/^\s+|\s+$/g, "");
+      }
+
+      function originalCopy() {
         var parts = [];
-        var nodes = lane.querySelectorAll(".cell");
-        for (var i = 0; i < nodes.length; i++) {
-          var text = nodes[i].textContent.replace(/^\s+|\s+$/g, "");
+        var list = rowsInOrder();
+        for (var i = 0; i < list.length; i++) {
+          var text = cellText(list[i].source);
           if (text) {
             parts.push(text);
           }
@@ -429,24 +441,27 @@
         return parts.join("\n");
       }
 
-      function hasText(lane) {
-        var nodes = lane.querySelectorAll(".cell");
-        for (var i = 0; i < nodes.length; i++) {
-          if (nodes[i].textContent.replace(/^\s+|\s+$/g, "")) {
-            return true;
+      function displayCopy() {
+        var parts = [];
+        var list = rowsInOrder();
+        for (var i = 0; i < list.length; i++) {
+          var node = list[i].single ? list[i].source : list[i].target;
+          var text = cellText(node);
+          if (text) {
+            parts.push(text);
           }
         }
-        return false;
+        return parts.join("\n");
       }
 
       function updateCopyButtons() {
-        var single = sameLanguage();
-        document.body.classList.toggle("single", single);
-        if (single) {
+        var mixed = anyTranslated();
+        document.body.classList.toggle("single", !mixed);
+        if (!mixed) {
           copySource.dataset.label = "コピー";
         } else {
-          copySource.dataset.label = langLabel(sourceLang.value) + "をコピー";
-          copyTarget.dataset.label = langLabel(targetLang.value) + "をコピー";
+          copySource.dataset.label = "原文をコピー";
+          copyTarget.dataset.label = "訳をコピー";
         }
         if (copySource.dataset.busy !== "1") {
           copySource.textContent = copySource.dataset.label;
@@ -456,14 +471,14 @@
         }
         copySource.setAttribute("aria-label", copySource.dataset.label);
         copyTarget.setAttribute("aria-label", copyTarget.dataset.label);
-        copySource.disabled = !hasText(laneSource);
-        copyTarget.disabled = !hasText(laneTarget);
+        copySource.disabled = !originalCopy();
+        copyTarget.disabled = !mixed || !displayCopy();
       }
 
-      function bindCopy(button, lane) {
+      function bindCopy(button, read) {
         var timer = 0;
         button.addEventListener("click", function () {
-          var text = columnText(lane);
+          var text = read();
           if (!text || !post("copy:" + text)) {
             return;
           }
@@ -477,48 +492,32 @@
         });
       }
 
-      bindCopy(copySource, laneSource);
-      bindCopy(copyTarget, laneTarget);
+      bindCopy(copySource, originalCopy);
+      bindCopy(copyTarget, displayCopy);
 
       function applyLayout() {
-        document.body.classList.toggle("single", sameLanguage());
+        document.body.classList.toggle("single", !anyTranslated());
         dragLane = null;
         var keys = Object.keys(rows);
         for (var i = 0; i < keys.length; i++) {
           mount(rows[keys[i]]);
         }
-        if (!sameLanguage()) {
+        if (anyTranslated()) {
           alignAll();
         }
         refreshChrome();
       }
 
-      function publishPair() {
-        var jaToEn = sourceLang.value === "ja" && targetLang.value === "en";
-        note.hidden = !jaToEn;
-        note.textContent = jaToEn
-          ? "日本語から英語の翻訳モデルはまだありません。聞き取った日本語だけ表示します。"
-          : "";
-        post("pair:" + sourceLang.value + ":" + targetLang.value);
-        applyLayout();
+      function publishPrimary() {
+        post("primary:" + primaryLang.value);
       }
 
-      sourceLang.addEventListener("change", publishPair);
-      targetLang.addEventListener("change", publishPair);
+      primaryLang.addEventListener("change", publishPrimary);
 
-      window.konnnyakuPair = function (source, target) {
-        if (source === "en" || source === "ja") {
-          sourceLang.value = source;
+      window.konnnyakuPrimary = function (lang) {
+        if (lang === "en" || lang === "ja") {
+          primaryLang.value = lang;
         }
-        if (target === "en" || target === "ja") {
-          targetLang.value = target;
-        }
-        var jaToEn = sourceLang.value === "ja" && targetLang.value === "en";
-        note.hidden = !jaToEn;
-        note.textContent = jaToEn
-          ? "日本語から英語の翻訳モデルはまだありません。聞き取った日本語だけ表示します。"
-          : "";
-        applyLayout();
       };
 
       function has(pair, key) {
@@ -544,6 +543,7 @@
           stack: stack,
           live: true,
           refined: false,
+          single: true,
         };
       }
 
@@ -577,7 +577,8 @@
         row.target.classList.toggle("preview", row.live);
         row.source.style.minHeight = "";
         row.target.style.minHeight = "";
-        if (sameLanguage()) {
+        if (row.single || !anyTranslated()) {
+          row.target.hidden = true;
           if (row.source.parentNode !== row.stack) {
             row.stack.insertBefore(row.source, row.stack.firstChild);
           }
@@ -587,6 +588,7 @@
           insertNode(laneSource, row.stack);
           return;
         }
+        row.target.hidden = false;
         insertNode(laneSource, row.source);
         insertNode(laneTarget, row.target);
         if (row.stack.parentNode) {
@@ -607,7 +609,7 @@
       }
 
       function alignAll() {
-        if (sameLanguage()) {
+        if (!anyTranslated()) {
           return;
         }
         var keys = Object.keys(rows);
@@ -660,6 +662,9 @@
 
       function paint(row, pair, live) {
         row.live = live;
+        if (has(pair, "single")) {
+          row.single = !!pair.single;
+        }
         if (has(pair, "turns") && Array.isArray(pair.turns)) {
           fillTurns(row.source, pair.turns, "source");
           if (pair.single) {
@@ -682,10 +687,7 @@
             row.target.textContent = pair.japanese || "";
           }
         }
-        mount(row);
-        if (!sameLanguage()) {
-          alignPair(row);
-        }
+        applyLayout();
       }
 
       function elementOf(node) {
@@ -707,7 +709,7 @@
       }
 
       function clampTo(lane) {
-        if (adjusting || !lane || sameLanguage()) {
+        if (adjusting || !lane || !anyTranslated()) {
           return;
         }
         var sel = document.getSelection();
