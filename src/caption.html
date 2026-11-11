@@ -10,6 +10,7 @@
         --ink-faint: rgba(255, 255, 255, 0.42);
         --pill: rgba(255, 255, 255, 0.1);
         --pill-ink: rgba(255, 255, 255, 0.78);
+        --col-gap: 28px;
       }
 
       * {
@@ -174,7 +175,7 @@
       .columns {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        column-gap: 28px;
+        column-gap: var(--col-gap);
         align-items: start;
       }
 
@@ -195,7 +196,8 @@
       .log {
         flex: 1;
         min-height: 0;
-        overflow: auto;
+        overflow-x: hidden;
+        overflow-y: auto;
       }
 
       .placeholder {
@@ -220,6 +222,16 @@
 
       body:not(.single) .cell.source {
         color: var(--ink-soft);
+      }
+
+      body:not(.single) .cell.source.span {
+        width: calc(200% + var(--col-gap));
+        color: var(--ink);
+      }
+
+      body:not(.single) .cell.target.span {
+        visibility: hidden;
+        pointer-events: none;
       }
 
       .stack .cell:empty {
@@ -575,9 +587,13 @@
       function mount(row) {
         row.source.classList.toggle("preview", row.live);
         row.target.classList.toggle("preview", row.live);
-        row.source.style.minHeight = "";
-        row.target.style.minHeight = "";
-        if (row.single || !anyTranslated()) {
+        row.source.style.height = "";
+        row.target.style.height = "";
+        var mixed = anyTranslated();
+        var span = mixed && row.single;
+        row.source.classList.toggle("span", span);
+        row.target.classList.toggle("span", span);
+        if (!mixed) {
           row.target.hidden = true;
           if (row.source.parentNode !== row.stack) {
             row.stack.insertBefore(row.source, row.stack.firstChild);
@@ -596,18 +612,6 @@
         }
       }
 
-      function alignPair(row) {
-        if (row.source.parentNode !== laneSource || row.target.parentNode !== laneTarget) {
-          return;
-        }
-        row.source.style.minHeight = "0px";
-        row.target.style.minHeight = "0px";
-        var height = Math.max(row.source.scrollHeight, row.target.scrollHeight);
-        var px = height + "px";
-        row.source.style.minHeight = px;
-        row.target.style.minHeight = px;
-      }
-
       function alignAll() {
         if (!anyTranslated()) {
           return;
@@ -620,18 +624,23 @@
           if (row.source.parentNode !== laneSource || row.target.parentNode !== laneTarget) {
             continue;
           }
-          row.source.style.minHeight = "0px";
-          row.target.style.minHeight = "0px";
+          row.source.style.height = "auto";
+          row.target.style.height = "auto";
           list.push(row);
         }
         var heights = [];
         for (i = 0; i < list.length; i++) {
-          heights.push(Math.max(list[i].source.scrollHeight, list[i].target.scrollHeight));
+          heights.push(
+            Math.max(
+              list[i].source.getBoundingClientRect().height,
+              list[i].target.getBoundingClientRect().height
+            )
+          );
         }
         for (i = 0; i < list.length; i++) {
-          var px = heights[i] + "px";
-          list[i].source.style.minHeight = px;
-          list[i].target.style.minHeight = px;
+          var px = Math.ceil(heights[i]) + "px";
+          list[i].source.style.height = px;
+          list[i].target.style.height = px;
         }
       }
 
@@ -836,7 +845,8 @@
             dropped.stack.remove();
             delete rows[rev];
           }
-          refreshChrome();
+          applyLayout();
+          stickToBottom();
           return;
         }
         if (settled[rev]) {

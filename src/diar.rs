@@ -1,8 +1,10 @@
 //! Speaker labels for a finished utterance.
 //!
-//! Segmentation is pyannote 3.0 and identity is 3D-Speaker ERes2Net, the CPU pair
-//! sherpa-onnx documents for offline diarization. Local speaker numbers reset on every
-//! call, so a session [`SpeakerBook`] keeps them stable by cosine similarity.
+//! Segmentation is pyannote 3.0. Identity is 3D-Speaker CAM++, trained on Chinese and
+//! English (`speech_campplus_sv_zh_en_16k-common_advanced`, Apache-2.0). Local speaker
+//! numbers reset on every call, so a session [`SpeakerBook`] keeps them stable by
+//! cosine similarity. A pitch change inside one clip stays one person unless the
+//! embeddings are clearly different.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,6 +29,9 @@ const MIN_OTHER_SHARE: f32 = 0.30;
 const MERGE_GAP_SECS: f32 = 0.35;
 const MAX_SPEAKERS: usize = 12;
 const MAX_EMBEDDINGS: usize = 3;
+/// File written by `scripts/download-asr.sh`. The Chinese-only ERes2Net file used
+/// the same `embedding.onnx` name and treated a change in pitch as a new person.
+const EMBEDDING_ID: &str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced";
 
 /// One slice of an utterance, in seconds at the original sample rate.
 ///
@@ -171,6 +176,14 @@ impl Diarizer {
                 model_dir.display()
             );
         }
+        let installed =
+            std::fs::read_to_string(model_dir.join("embedding.model")).unwrap_or_default();
+        if installed.trim() != EMBEDDING_ID {
+            anyhow::bail!(
+                "speaker embedding in {} is not {EMBEDDING_ID}. Run scripts/download-asr.sh",
+                model_dir.display()
+            );
+        }
         let threads = num_threads.max(1);
         let mut config = OfflineSpeakerDiarizationConfig::default();
         config.segmentation.pyannote.model = Some(path_string(&segmentation));
@@ -218,7 +231,7 @@ impl Diarizer {
             return self.whole_clip(&audio, model_rate);
         }
 
-        let mut grouped: HashMap<i32, (f32, f32, usize, usize)> = HashMap::new();
+        let mut grouped: HashMap<i32, (f32, Vec<(usize, usize)>)> = HashMap::new();
         for segment in &segments {
             let duration = segment.end - segment.start;
             if duration < MIN_TURN_SECS {
@@ -226,28 +239,46 @@ impl Diarizer {
             }
             let start = secs_to_index(segment.start, model_rate as u32, audio.len());
             let end = secs_to_index(segment.end, model_rate as u32, audio.len());
-            let entry = grouped
-                .entry(segment.speaker)
-                .or_insert((0.0, 0.0, start, end));
-            entry.0 += duration;
-            if duration > entry.1 {
-                *entry = (entry.0, duration, start, end);
+            if end <= start {
+                continue;
             }
+            let entry = grouped.entry(segment.speaker).or_default();
+            entry.0 += duration;
+            entry.1.push((start, end));
         }
-        let totals: Vec<f32> = grouped.values().map(|(total, _, _, _)| *total).collect();
+        let totals: Vec<f32> = grouped.values().map(|(total, _)| *total).collect();
         if single_voice(&totals) {
             return self.whole_clip(&audio, model_rate);
         }
 
-        let mut embeddings = HashMap::new();
-        for (local, (total, _, start, end)) in &grouped {
-            if *total < MIN_OTHER_SECS || end <= start {
+        let mut locals = Vec::new();
+        for (local, (total, parts)) in &grouped {
+            if *total < MIN_OTHER_SECS {
                 continue;
             }
-            if let Some(embedding) = self.embed_window(&audio[*start..*end], model_rate) {
-                embeddings.insert(*local, embedding);
+            let pooled = pool_parts(&audio, parts);
+            if let Some(embedding) = self.embed_window(&pooled, model_rate) {
+                locals.push((*local, embedding));
             }
         }
+        if locals.len() <= 1 {
+            return self.whole_clip(&audio, model_rate);
+        }
+        let units: Vec<Vec<f32>> = locals
+            .iter()
+            .filter_map(|(_, embedding)| unit(embedding.clone()))
+            .collect();
+        if units.len() != locals.len() {
+            return self.whole_clip(&audio, model_rate);
+        }
+        if one_voice(&voice_groups(&units)) {
+            tracing::debug!(
+                speakers = locals.len(),
+                "kept one speaker; the other voices in this clip were not clearly different"
+            );
+            return self.whole_clip(&audio, model_rate);
+        }
+        let embeddings: HashMap<i32, Vec<f32>> = locals.into_iter().collect();
 
         let mut turns: Vec<SpeechTurn> = Vec::new();
         for segment in segments {
@@ -366,6 +397,56 @@ fn resample(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
     out
 }
 
+fn pool_parts(audio: &[f32], parts: &[(usize, usize)]) -> Vec<f32> {
+    let mut pooled = Vec::new();
+    for &(start, end) in parts {
+        let end = end.min(audio.len());
+        let start = start.min(end);
+        pooled.extend_from_slice(&audio[start..end]);
+    }
+    pooled
+}
+
+/// Group indexes of unit embeddings. Voices at or above [`NEW_SPEAKER_COSINE`]
+/// share a group, so a change in pitch does not become a second person.
+fn voice_groups(embeddings: &[Vec<f32>]) -> Vec<usize> {
+    let n = embeddings.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if dot(&embeddings[i], &embeddings[j]) >= NEW_SPEAKER_COSINE {
+                let left = find(&mut parent, i);
+                let right = find(&mut parent, j);
+                if left != right {
+                    parent[right] = left;
+                }
+            }
+        }
+    }
+    let mut dense = HashMap::new();
+    let mut groups = Vec::with_capacity(n);
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        let next = dense.len();
+        groups.push(*dense.entry(root).or_insert(next));
+    }
+    groups
+}
+
+fn one_voice(groups: &[usize]) -> bool {
+    groups
+        .first()
+        .is_none_or(|first| groups.iter().all(|group| group == first))
+}
+
+fn find(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+    }
+    index
+}
+
 fn unit(embedding: Vec<f32>) -> Option<Vec<f32>> {
     let mut norm = 0.0;
     for value in &embedding {
@@ -450,6 +531,14 @@ mod tests {
         assert!(single_voice(&[5.0, 0.4]));
         assert!(single_voice(&[4.0, 0.8]));
         assert!(!single_voice(&[3.0, 2.0]));
+    }
+
+    #[test]
+    fn a_change_in_pitch_stays_one_voice() {
+        let same = voice_groups(&[vec![1.0, 0.0], vec![0.8, 0.6]]);
+        assert!(one_voice(&same), "{same:?}");
+        let apart = voice_groups(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        assert_ne!(apart[0], apart[1]);
     }
 
     #[test]

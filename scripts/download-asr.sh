@@ -104,12 +104,20 @@ download_diar() {
   local target="${DEST}/diar"
   local segmentation="${target}/segmentation.onnx"
   local embedding="${target}/embedding.onnx"
-  # The release tag really is spelled "recongition".
-  local embedding_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+  # Apache-2.0. 3D-Speaker CAM++, Chinese and English. The sherpa-onnx release
+  # tag really is spelled "recongition". Weights stay in models/ and out of git.
+  # This id must match EMBEDDING_ID in src/diar.rs.
+  local embedding_id="3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced"
+  local embedding_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/${embedding_id}.onnx"
+  local embedding_stamp="${target}/embedding.model"
   local archive="sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
   local archive_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/${archive}"
+  local current=""
+  if [[ -f "${embedding_stamp}" ]]; then
+    current="$(<"${embedding_stamp}")"
+  fi
 
-  if [[ -f "${segmentation}" && -f "${embedding}" ]]; then
+  if [[ -f "${segmentation}" && -f "${embedding}" && "${current}" == "${embedding_id}" ]]; then
     echo "Speaker diarization models already present at ${target}"
     return 0
   fi
@@ -129,9 +137,11 @@ download_diar() {
     rm -rf "${target}/sherpa-onnx-pyannote-segmentation-3-0"
   fi
 
-  if [[ ! -f "${embedding}" ]]; then
+  if [[ ! -f "${embedding}" || "${current}" != "${embedding_id}" ]]; then
     echo "Downloading ${embedding_url}"
-    curl -L --fail --retry 3 -o "${embedding}" "${embedding_url}"
+    curl -L --fail --retry 3 -o "${embedding}.partial" "${embedding_url}"
+    mv "${embedding}.partial" "${embedding}"
+    printf '%s\n' "${embedding_id}" > "${embedding_stamp}"
   fi
 
   echo "Speaker diarization ready at ${target}"
