@@ -350,6 +350,7 @@
       });
 
       clearButton.addEventListener("click", function () {
+        post("clear");
         Object.keys(rows).forEach(function (key) {
           settled[key] = true;
           var row = rows[key];

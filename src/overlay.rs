@@ -24,6 +24,7 @@ pub fn run_caption_hud(
     lines: Receiver<String>,
     langs: Arc<crate::LangPair>,
     hear: Arc<crate::HearFlags>,
+    saved: Arc<crate::caption_log::CaptionLog>,
 ) -> Result<()> {
     let mut event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -63,6 +64,7 @@ pub fn run_caption_hud(
     let drag_proxy = proxy;
     let ipc_langs = Arc::clone(&langs);
     let ipc_hear = Arc::clone(&hear);
+    let ipc_saved = Arc::clone(&saved);
     let init = format!(
         "window.konnnyakuPrimary && window.konnnyakuPrimary('{}'); window.konnnyakuHear && window.konnnyakuHear({}, {})",
         langs.primary().label(),
@@ -77,11 +79,18 @@ pub fn run_caption_hud(
             let body = request.body();
             match body.as_str() {
                 "close" => close_flag.store(false, Ordering::SeqCst),
+                "clear" => ipc_saved.clear(),
                 "drag" => {
                     let _ = drag_proxy.send_event(UiEvent::Drag);
                 }
-                "primary:en" => ipc_langs.set_primary(crate::CaptionLang::En),
-                "primary:ja" => ipc_langs.set_primary(crate::CaptionLang::Ja),
+                "primary:en" => {
+                    ipc_langs.set_primary(crate::CaptionLang::En);
+                    ipc_saved.set_primary("en");
+                }
+                "primary:ja" => {
+                    ipc_langs.set_primary(crate::CaptionLang::Ja);
+                    ipc_saved.set_primary("ja");
+                }
                 "hear:in:0" => ipc_hear.set_input(false),
                 "hear:in:1" => ipc_hear.set_input(true),
                 "hear:out:0" => ipc_hear.set_output(false),

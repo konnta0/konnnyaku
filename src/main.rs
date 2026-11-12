@@ -1,5 +1,6 @@
 mod asr;
 mod audio;
+mod caption_log;
 mod diar;
 mod haas;
 mod lid;
@@ -68,6 +69,8 @@ enum Command {
     Translate(TranslateArgs),
     /// Live ASR with Japanese subtitles for finalized utterances.
     Live(LiveArgs),
+    /// Print the translated captions saved by `live` in this directory.
+    Captions,
     /// Summarize microphone speech. This does not translate playback.
     Summary(SummaryArgs),
     /// List running apps that currently have tappable audio output.
@@ -232,6 +235,7 @@ fn main() -> Result<()> {
         Command::Asr(args) => run_asr(args),
         Command::Translate(args) => run_translate(args),
         Command::Live(args) => run_live(args),
+        Command::Captions => print_saved_captions(),
         Command::Summary(args) => run_summary(args),
         Command::Apps => run_apps(),
     }
@@ -353,23 +357,39 @@ fn run_translate(args: TranslateArgs) -> Result<()> {
     Ok(())
 }
 
+fn print_saved_captions() -> Result<()> {
+    let json = caption_log::read_json(Path::new("meetings/captions.json"))?;
+    println!("{json}");
+    Ok(())
+}
+
 fn run_live(args: LiveArgs) -> Result<()> {
     let langs = Arc::new(LangPair::parse(&args.primary)?);
     let hear = Arc::new(HearFlags::from_live(&args)?);
+    let saved = Arc::new(caption_log::CaptionLog::create(
+        Path::new("meetings/captions.json"),
+        langs.primary().label(),
+    )?);
     #[cfg(target_os = "macos")]
     if !args.cli {
-        return run_live_hud(args, langs, Arc::clone(&hear));
+        return run_live_hud(args, langs, Arc::clone(&hear), saved);
     }
-    run_live_session(args, None, None, langs, hear)
+    run_live_session(args, None, None, langs, hear, saved)
 }
 
 #[cfg(target_os = "macos")]
-fn run_live_hud(args: LiveArgs, langs: Arc<LangPair>, hear: Arc<HearFlags>) -> Result<()> {
+fn run_live_hud(
+    args: LiveArgs,
+    langs: Arc<LangPair>,
+    hear: Arc<HearFlags>,
+    saved: Arc<caption_log::CaptionLog>,
+) -> Result<()> {
     let running = install_ctrlc()?;
     let (tx, rx) = bounded::<String>(32);
     let capture_running = Arc::clone(&running);
     let ui_langs = Arc::clone(&langs);
     let session_hear = Arc::clone(&hear);
+    let session_saved = Arc::clone(&saved);
     let join = std::thread::Builder::new()
         .name("konnnyaku-live".into())
         .spawn(move || {
@@ -379,12 +399,13 @@ fn run_live_hud(args: LiveArgs, langs: Arc<LangPair>, hear: Arc<HearFlags>) -> R
                 Some(tx),
                 langs,
                 session_hear,
+                session_saved,
             );
             capture_running.store(false, Ordering::SeqCst);
             result
         })
         .context("spawn live thread")?;
-    let ui = crate::overlay::run_caption_hud(Arc::clone(&running), rx, ui_langs, hear);
+    let ui = crate::overlay::run_caption_hud(Arc::clone(&running), rx, ui_langs, hear, saved);
     running.store(false, Ordering::SeqCst);
     let capture_result = join
         .join()
@@ -399,6 +420,7 @@ fn run_live_session(
     captions: Option<Sender<String>>,
     langs: Arc<LangPair>,
     hear: Arc<HearFlags>,
+    saved: Arc<caption_log::CaptionLog>,
 ) -> Result<()> {
     let output_source = live_output_source(&args)?;
     let asr_paths = AsrModelPaths::from_dir(&args.asr_model_dir)?;
@@ -463,6 +485,7 @@ fn run_live_session(
     let worker_ui = captions.clone();
     let worker_tail = Arc::clone(&tail);
     let worker_en_inbox = Arc::clone(&en_inbox);
+    let worker_saved = Arc::clone(&saved);
 
     let mt_thread = std::thread::spawn(move || -> Result<TranslationMetrics> {
         let mut e2e = TranslationMetrics::new()?;
@@ -481,6 +504,7 @@ fn run_live_session(
                                 Some(&ui),
                                 &worker_langs,
                                 &mut kit,
+                                &worker_saved,
                             ),
                             Err(_) => break,
                         }
@@ -505,6 +529,7 @@ fn run_live_session(
                                 Some(&ui),
                                 &worker_langs,
                                 &mut kit,
+                                &worker_saved,
                             );
                             break;
                         }
@@ -521,6 +546,7 @@ fn run_live_session(
                     None,
                     &worker_langs,
                     &mut kit,
+                    &worker_saved,
                 );
             }
         }
@@ -539,6 +565,7 @@ fn run_live_session(
     } else {
         eprintln!("Captions from {label}. Close the window or press Ctrl+C to stop.");
     }
+    eprintln!("Translated text is in meetings/captions.json. Read it with: konnnyaku captions");
     pump_live_audio(
         &running,
         &mut engine,
@@ -1798,9 +1825,12 @@ fn drain_english(
     captions: Option<&Sender<String>>,
     langs: &LangPair,
     kit: &mut RecognizeKit,
+    saved: &caption_log::CaptionLog,
 ) {
     while let Ok(job) = jobs.recv() {
-        record_caption(metrics, whisper, translator, job, captions, langs, kit);
+        record_caption(
+            metrics, whisper, translator, job, captions, langs, kit, saved,
+        );
     }
 }
 
@@ -1812,8 +1842,9 @@ fn record_caption(
     captions: Option<&Sender<String>>,
     langs: &LangPair,
     kit: &mut RecognizeKit,
+    saved: &caption_log::CaptionLog,
 ) {
-    match caption_final(whisper, translator, job, captions, langs, kit) {
+    match caption_final(whisper, translator, job, captions, langs, kit, saved) {
         Ok(Some(elapsed)) => metrics.record(elapsed),
         Ok(None) => {}
         Err(err) => tracing::error!(%err, "caption failed"),
@@ -1883,6 +1914,7 @@ fn caption_final(
     captions: Option<&Sender<String>>,
     langs: &LangPair,
     kit: &mut RecognizeKit,
+    saved: &caption_log::CaptionLog,
 ) -> Result<Option<Duration>> {
     let primary = langs.primary();
     let mut turns = kit
@@ -1949,6 +1981,14 @@ fn caption_final(
     }
     let elapsed = job.utterance_ended.elapsed();
     send_lines(captions, "commit", job.generation, &lines, true);
+    if let Err(err) = saved.record(
+        primary.label(),
+        lines
+            .iter()
+            .map(|line| (line.speaker, line.source.as_str(), line.target.as_str())),
+    ) {
+        tracing::warn!(%err, "could not save translated captions");
+    }
     Ok(Some(elapsed))
 }
 
