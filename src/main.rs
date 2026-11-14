@@ -8,6 +8,8 @@ mod metrics;
 mod mix;
 #[cfg(target_os = "macos")]
 mod overlay;
+mod paths;
+mod setup;
 mod summary;
 mod text;
 mod translation;
@@ -16,7 +18,7 @@ mod whisper;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,11 +41,6 @@ use crate::translation::{OnnxMarianTranslator, Translator};
 use crate::vad::SpeechGate;
 use crate::whisper::WhisperRescorer;
 
-const DEFAULT_ASR_DIR: &str = "models/asr/zipformer-en";
-const DEFAULT_RESCORE_DIR: &str = "models/asr/parakeet-en";
-const DEFAULT_LID_DIR: &str = "models/asr/whisper-tiny";
-const DEFAULT_MT_DIR: &str = "models/translation/marian-en-ja/onnx";
-const DEFAULT_MT_JA_EN_DIR: &str = "models/translation/marian-ja-en/onnx";
 const AUDIO_QUEUE_CAPACITY: usize = 50;
 const TRANSLATION_QUEUE_CAPACITY: usize = 8;
 const CHUNK_MS: u32 = 200;
@@ -54,6 +51,7 @@ const LIVE_TURN_SECS: u32 = 6;
 #[derive(Parser, Debug)]
 #[command(
     name = "konnnyaku",
+    version,
     about = "Fully local English speech to Japanese subtitles"
 )]
 struct Cli {
@@ -69,8 +67,10 @@ enum Command {
     Translate(TranslateArgs),
     /// Live ASR with Japanese subtitles for finalized utterances.
     Live(LiveArgs),
-    /// Print the translated captions saved by `live` in this directory.
+    /// Print the translated captions saved by the running `live` session.
     Captions,
+    /// Download and verify the models. Run once after installing.
+    Setup(SetupArgs),
     /// Summarize microphone speech. This does not translate playback.
     Summary(SummaryArgs),
     /// List running apps that currently have tappable audio output.
@@ -92,7 +92,7 @@ struct AsrArgs {
     #[arg(long)]
     app: Option<String>,
     /// Directory containing encoder/decoder/joiner/tokens.
-    #[arg(long, default_value = DEFAULT_ASR_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::ASR_DIR))]
     model_dir: PathBuf,
     /// Endpoint rule2 trailing silence in seconds.
     #[arg(long, default_value_t = 0.8)]
@@ -111,7 +111,7 @@ struct TranslateArgs {
     #[arg(long)]
     file: Option<PathBuf>,
     /// Directory containing encoder/decoder ONNX and tokenizers.
-    #[arg(long, default_value = DEFAULT_MT_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::MT_DIR))]
     model_dir: PathBuf,
 }
 
@@ -133,22 +133,22 @@ struct LiveArgs {
     #[arg(long, default_value = "ja")]
     primary: String,
     /// Haas Japanese ONNX directory.
-    #[arg(long, default_value = "models/asr/haas-ja")]
+    #[arg(long, default_value_os_t = paths::model(paths::HAAS_DIR))]
     haas_dir: PathBuf,
     /// Pyannote segmentation and speaker-embedding ONNX directory.
-    #[arg(long, default_value = "models/asr/diar")]
+    #[arg(long, default_value_os_t = paths::model(paths::DIAR_DIR))]
     diar_dir: PathBuf,
     /// Directory containing encoder/decoder/joiner/tokens.
-    #[arg(long, default_value = DEFAULT_ASR_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::ASR_DIR))]
     asr_model_dir: PathBuf,
     /// English-to-Japanese Marian ONNX directory.
-    #[arg(long, default_value = DEFAULT_MT_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::MT_DIR))]
     mt_model_dir: PathBuf,
     /// Japanese-to-English Marian ONNX directory.
-    #[arg(long, default_value = DEFAULT_MT_JA_EN_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::MT_JA_EN_DIR))]
     mt_ja_en_dir: PathBuf,
     /// Multilingual Whisper tiny directory used to detect English or Japanese.
-    #[arg(long, default_value = DEFAULT_LID_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::LID_DIR))]
     lid_dir: PathBuf,
     /// Endpoint rule2 trailing silence in seconds.
     #[arg(long, default_value_t = 0.8)]
@@ -157,10 +157,10 @@ struct LiveArgs {
     #[arg(long, default_value_t = 2)]
     threads: i32,
     /// English recognizer. A Parakeet directory, or Whisper files without a joiner.
-    #[arg(long, default_value = DEFAULT_RESCORE_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::RESCORE_DIR))]
     whisper_dir: PathBuf,
     /// Silero VAD ONNX path.
-    #[arg(long, default_value = "models/asr/silero_vad.onnx")]
+    #[arg(long, default_value_os_t = paths::model(paths::VAD_MODEL))]
     vad_model: PathBuf,
     /// Disable the English recognizer and keep Zipformer text.
     #[arg(long, default_value_t = false)]
@@ -168,6 +168,13 @@ struct LiveArgs {
     /// Disable Silero VAD music suppression.
     #[arg(long, default_value_t = false)]
     no_vad: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct SetupArgs {
+    /// Download every model again, even when the files on disk already match.
+    #[arg(long, default_value_t = false)]
+    force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -191,10 +198,10 @@ struct SummaryArgs {
     #[arg(long, default_value_t = false)]
     cli: bool,
     /// Directory containing encoder/decoder/joiner/tokens.
-    #[arg(long, default_value = DEFAULT_ASR_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::ASR_DIR))]
     asr_model_dir: PathBuf,
     /// Directory containing encoder/decoder ONNX and tokenizers.
-    #[arg(long, default_value = DEFAULT_MT_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::MT_DIR))]
     mt_model_dir: PathBuf,
     /// Endpoint rule2 trailing silence in seconds.
     #[arg(long, default_value_t = 0.8)]
@@ -203,10 +210,10 @@ struct SummaryArgs {
     #[arg(long, default_value_t = 2)]
     threads: i32,
     /// English rescoring model. Whisper files, or a Parakeet directory with a joiner.
-    #[arg(long, default_value = DEFAULT_RESCORE_DIR)]
+    #[arg(long, default_value_os_t = paths::model(paths::RESCORE_DIR))]
     whisper_dir: PathBuf,
     /// Silero VAD ONNX path.
-    #[arg(long, default_value = "models/asr/silero_vad.onnx")]
+    #[arg(long, default_value_os_t = paths::model(paths::VAD_MODEL))]
     vad_model: PathBuf,
     /// Disable English rescoring of Zipformer finals.
     #[arg(long, default_value_t = false)]
@@ -236,6 +243,7 @@ fn main() -> Result<()> {
         Command::Translate(args) => run_translate(args),
         Command::Live(args) => run_live(args),
         Command::Captions => print_saved_captions(),
+        Command::Setup(args) => setup::run(args.force),
         Command::Summary(args) => run_summary(args),
         Command::Apps => run_apps(),
     }
@@ -358,7 +366,7 @@ fn run_translate(args: TranslateArgs) -> Result<()> {
 }
 
 fn print_saved_captions() -> Result<()> {
-    let json = caption_log::read_json(Path::new("meetings/captions.json"))?;
+    let json = caption_log::read_json(&paths::captions_file())?;
     println!("{json}");
     Ok(())
 }
@@ -367,7 +375,7 @@ fn run_live(args: LiveArgs) -> Result<()> {
     let langs = Arc::new(LangPair::parse(&args.primary)?);
     let hear = Arc::new(HearFlags::from_live(&args)?);
     let saved = Arc::new(caption_log::CaptionLog::create(
-        Path::new("meetings/captions.json"),
+        &paths::captions_file(),
         langs.primary().label(),
     )?);
     #[cfg(target_os = "macos")]
@@ -565,7 +573,10 @@ fn run_live_session(
     } else {
         eprintln!("Captions from {label}. Close the window or press Ctrl+C to stop.");
     }
-    eprintln!("Translated text is in meetings/captions.json. Read it with: konnnyaku captions");
+    eprintln!(
+        "Translated text is in {}. Read it with: konnnyaku captions",
+        paths::captions_file().display()
+    );
     pump_live_audio(
         &running,
         &mut engine,
@@ -730,7 +741,10 @@ fn run_summary_capture(args: SummaryArgs) -> Result<()> {
 
     if cache.wrote_sections.is_none() {
         if cache.wrote_file {
-            println!("文字起こしだけを meetings/latest.json に書きました。");
+            println!(
+                "文字起こしだけを {} に書きました。",
+                paths::meetings_dir().join("latest.json").display()
+            );
         } else {
             println!("会議メモにできる発話がまだありません。");
         }
@@ -810,8 +824,8 @@ fn publish_note(
         decisions,
         actions,
     };
-    let dir = Path::new("meetings");
-    std::fs::create_dir_all(dir).context("create meetings directory")?;
+    let dir = paths::meetings_dir();
+    std::fs::create_dir_all(&dir).context("create meetings directory")?;
     let path = dir.join("latest.json");
     std::fs::write(&path, serde_json::to_string_pretty(&note)?)
         .with_context(|| format!("write {}", path.display()))?;
@@ -877,7 +891,10 @@ fn print_note(note: &MeetingNote) {
     print_section("議題", &note.topics);
     print_section("決定", &note.decisions);
     print_section("次のアクション", &note.actions);
-    println!("wrote meetings/latest.json");
+    println!(
+        "wrote {}",
+        paths::meetings_dir().join("latest.json").display()
+    );
     println!();
     let _ = io::stdout().flush();
 }
@@ -1565,7 +1582,7 @@ impl SpeakerState {
                             tx,
                             &serde_json::json!({
                                 "kind": "status",
-                                "message": "話者分離のモデルがありません。scripts/download-asr.sh を実行してください。",
+                                "message": "話者分離のモデルがありません。konnnyaku setup を実行してください。",
                             }),
                             true,
                         );
@@ -1642,7 +1659,7 @@ impl RecognizeKit {
                             tx,
                             &serde_json::json!({
                                 "kind": "status",
-                                "message": "日本語の聞き取りモデルがありません。scripts/download-asr.sh を実行してください。",
+                                "message": "日本語の聞き取りモデルがありません。konnnyaku setup を実行してください。",
                             }),
                             true,
                         );
@@ -1692,7 +1709,7 @@ impl LanguageState {
                             tx,
                             &serde_json::json!({
                                 "kind": "status",
-                                "message": "言語判定のモデルがありません。scripts/download-asr.sh を実行してください。",
+                                "message": "言語判定のモデルがありません。konnnyaku setup を実行してください。",
                             }),
                             true,
                         );
@@ -1762,7 +1779,7 @@ impl JaEnModel {
                             tx,
                             &serde_json::json!({
                                 "kind": "status",
-                                "message": "日本語から英語の翻訳モデルがありません。scripts/export-marian-onnx.sh で書き出してください。",
+                                "message": "日本語から英語の翻訳モデルがありません。konnnyaku setup を実行してください。",
                             }),
                             true,
                         );

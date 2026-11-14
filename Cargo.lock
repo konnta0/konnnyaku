@@ -1790,6 +1790,7 @@ dependencies = [
  "ort",
  "serde",
  "serde_json",
+ "sha2",
  "sherpa-onnx",
  "tao",
  "tokenizers",

@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Tag matches Cargo.toml
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ "v${version}" != "${TAG}" ]]; then
+            echo "::error::tag ${TAG} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Test
+        run: cargo test --locked --bin konnnyaku
+
+      - name: Build
+        run: cargo build --locked --release --bin konnnyaku
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          name="konnnyaku-v${VERSION}-aarch64-apple-darwin"
+          mkdir -p "dist/${name}"
+          cp target/release/konnnyaku LICENSE README.md THIRD_PARTY_NOTICES.md "dist/${name}/"
+          lipo -archs "dist/${name}/konnnyaku" | grep -qx arm64
+          tar -czf "dist/${name}.tar.gz" -C "dist/${name}" .
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "sha256=$(cut -d' ' -f1 "dist/${name}.tar.gz.sha256")" >> "${GITHUB_OUTPUT}"
+          echo "asset=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: |
+          gh release create "${TAG}" "${ASSET}" "${ASSET}.sha256" \
+            --verify-tag \
+            --title "konnnyaku ${TAG}" \
+            --generate-notes
+
+  homebrew:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Open a formula PR on the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set; update konnta0/homebrew-tap by hand."
+            exit 0
+          fi
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! "${SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::unexpected version or checksum"
+            exit 1
+          fi
+          branch="konnnyaku-${VERSION}"
+          gh repo clone konnta0/homebrew-tap tap -- --depth 1
+          sed -e "s/@VERSION@/${VERSION}/g" -e "s/@SHA256@/${SHA256}/g" \
+            packaging/homebrew/konnnyaku.rb.in > tap/Formula/konnnyaku.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git add Formula/konnnyaku.rb
+          git commit -m "konnnyaku ${VERSION}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/konnta0/homebrew-tap.git" "${branch}"
+          gh pr create --repo konnta0/homebrew-tap --head "${branch}" \
+            --title "konnnyaku ${VERSION}" \
+            --body "Release https://github.com/konnta0/konnnyaku/releases/tag/v${VERSION}"

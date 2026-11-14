@@ -110,7 +110,7 @@ fn find_onnx(dir: &Path, role: &str) -> Result<PathBuf> {
     }
     int8.or(full).ok_or_else(|| {
         anyhow!(
-            "missing {role} onnx in {}. Run scripts/download-asr.sh",
+            "missing {role} onnx in {}. Run konnnyaku setup",
             dir.display()
         )
     })
@@ -132,7 +132,7 @@ fn find_tokens(dir: &Path) -> Result<PathBuf> {
     }
     preferred.or(plain).ok_or_else(|| {
         anyhow!(
-            "missing tokens.txt in {}. Run scripts/download-asr.sh",
+            "missing tokens.txt in {}. Run konnnyaku setup",
             dir.display()
         )
     })

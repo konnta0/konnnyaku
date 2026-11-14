@@ -11,10 +11,54 @@ Fully local English speech → Japanese subtitle PoC for Apple Silicon.
 - Inference does not use the network after models are downloaded.
 - Browser / YouTube: `--app "Google Chrome"` taps that app's output (all tabs). `--loopback` taps every app on the default output. Speech and interviews work better than songs.
 
-## Setup
+## Install (macOS, Apple Silicon)
 
 ```bash
-# Zipformer + Silero VAD + Whisper tiny.en (~420 MB)
+brew install konnta0/tap/konnnyaku
+konnnyaku setup                        # once; downloads about 2.5 GB of models
+konnnyaku live --app "Google Chrome"   # caption window
+konnnyaku captions                     # translated lines as JSON
+```
+
+Without Homebrew, download `konnnyaku-vX.Y.Z-aarch64-apple-darwin.tar.gz` from the GitHub release, check it against the `.sha256` file, and put `konnnyaku` on your `PATH`. Nothing else has to be installed: `setup` uses the system `curl` and `tar`, and checks every model file against a pinned SHA-256 before using it.
+
+Models and captions live in `~/Library/Application Support/konnnyaku`. Set `KONNNYAKU_HOME` to use another directory. In a source checkout that already has `models/asr/zipformer-en`, the working directory is used instead, as before.
+
+System Audio Recording permission (System Settings → Privacy & Security) is granted to the terminal app you start `konnnyaku` from, not to `konnnyaku` itself.
+
+### For AI agents
+
+While `live` runs, each settled line is written to `captions.json` in that directory. Any process can read it with:
+
+```bash
+konnnyaku captions
+```
+
+```json
+{
+  "lines": [
+    { "primary": "ja", "source": "No, wait.", "translation": "いや、待って。", "text": "いや、待って。" },
+    { "primary": "ja", "speaker": 2, "source": "説明がある。", "text": "説明がある。" }
+  ],
+  "primary": "ja"
+}
+```
+
+`text` is the line in the display language. `translation` is present only when the speech was in the other language. The file keeps the newest 400 lines, is cleared by the window's クリア button, and is replaced when a new `live` session starts.
+
+## Release (maintainers)
+
+1. Bump `version` in `Cargo.toml` and commit.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. `.github/workflows/release.yml` checks that the tag matches `Cargo.toml`, runs the tests, builds the arm64 binary, and publishes the tarball and its `.sha256` to the GitHub release.
+4. With the `HOMEBREW_TAP_TOKEN` secret set (a fine-grained token that can only write `konnta0/homebrew-tap`), the same workflow opens a PR there from `packaging/homebrew/konnnyaku.rb.in`.
+
+The FuguMT ONNX archives that `setup` downloads are the `models-v1` release. Rebuild them with `scripts/package-marian-models.sh`; if their contents change, publish them under a new tag and update the pins in `src/setup.rs`. Model licenses are listed in `THIRD_PARTY_NOTICES.md`.
+
+## Development setup
+
+```bash
+# Same models as `konnnyaku setup`, plus optional Whisper tiny.en and distil-small
 ./scripts/download-asr.sh
 
 # Marian EN→JA ONNX export (one-time; needs Python via uv)
@@ -79,7 +123,7 @@ Measured on this Apple Silicon machine (release build, not a 60-minute soak):
 - ASR RTF ≈ 0.04 on the bundled Zipformer test WAV
 - Translation P95 ≈ 220 ms on 20 technical sentences
 
-`staka/fugumt-en-ja` is CC-BY-SA-4.0. The Zipformer ASR package comes from sherpa-onnx releases.
+`staka/fugumt-en-ja` is CC-BY-SA-4.0. See `THIRD_PARTY_NOTICES.md` for every model.
 
 ## Layout
 
@@ -93,5 +137,8 @@ src/text.rs          junk English / Japanese filters
 src/summary.rs       meeting note: transcript, topics, decisions, actions
 src/translation.rs   Translator + OnnxMarianTranslator
 src/metrics.rs       RTF and translation percentiles
+src/paths.rs         KONNNYAKU_HOME / Application Support / checkout paths
+src/setup.rs         `konnnyaku setup`: pinned model downloads
+src/caption_log.rs   captions.json for `konnnyaku captions`
 models/              gitignored weights
 ```

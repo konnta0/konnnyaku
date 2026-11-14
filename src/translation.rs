@@ -270,7 +270,7 @@ impl TranslationModelPaths {
         ] {
             if !path.is_file() {
                 return Err(anyhow!(
-                    "missing translation {label} at {}. Run scripts/export-marian-onnx.sh",
+                    "missing translation {label} at {}. Run konnnyaku setup",
                     path.display()
                 ));
             }

@@ -29,9 +29,10 @@ const MIN_OTHER_SHARE: f32 = 0.30;
 const MERGE_GAP_SECS: f32 = 0.35;
 const MAX_SPEAKERS: usize = 12;
 const MAX_EMBEDDINGS: usize = 3;
-/// File written by `scripts/download-asr.sh`. The Chinese-only ERes2Net file used
-/// the same `embedding.onnx` name and treated a change in pitch as a new person.
-const EMBEDDING_ID: &str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced";
+/// Written to `embedding.model` by `konnnyaku setup`. The Chinese-only ERes2Net
+/// file used the same `embedding.onnx` name and treated a change in pitch as a
+/// new person.
+pub const EMBEDDING_ID: &str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced";
 
 /// One slice of an utterance, in seconds at the original sample rate.
 ///
@@ -172,7 +173,7 @@ impl Diarizer {
         let embedding = model_dir.join("embedding.onnx");
         if !segmentation.is_file() || !embedding.is_file() {
             anyhow::bail!(
-                "missing segmentation.onnx or embedding.onnx in {}. Run scripts/download-asr.sh",
+                "missing segmentation.onnx or embedding.onnx in {}. Run konnnyaku setup",
                 model_dir.display()
             );
         }
@@ -180,7 +181,7 @@ impl Diarizer {
             std::fs::read_to_string(model_dir.join("embedding.model")).unwrap_or_default();
         if installed.trim() != EMBEDDING_ID {
             anyhow::bail!(
-                "speaker embedding in {} is not {EMBEDDING_ID}. Run scripts/download-asr.sh",
+                "speaker embedding in {} is not {EMBEDDING_ID}. Run konnnyaku setup",
                 model_dir.display()
             );
         }

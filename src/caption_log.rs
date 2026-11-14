@@ -145,7 +145,9 @@ impl CaptionLog {
 /// Pretty JSON for an agent. Missing file means live has not been started here.
 pub fn read_json(path: &Path) -> Result<String> {
     let meta = std::fs::symlink_metadata(path).map_err(|_| {
-        anyhow!("実行中の文字起こしがありません。このディレクトリで live を起動してから、もう一度実行してください。")
+        anyhow!(
+            "実行中の文字起こしがありません。konnnyaku live を起動してから、もう一度実行してください。"
+        )
     })?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         anyhow::bail!("文字起こしの読み取りに失敗しました。");

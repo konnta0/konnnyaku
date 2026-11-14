@@ -67,7 +67,7 @@ impl AsrModelPaths {
         ] {
             if !path.is_file() {
                 return Err(anyhow!(
-                    "missing ASR {label} at {}. Run scripts/download-asr.sh",
+                    "missing ASR {label} at {}. Run konnnyaku setup",
                     path.display()
                 ));
             }

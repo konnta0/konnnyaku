@@ -31,7 +31,7 @@ impl SpeechGate {
     pub fn from_path(model_path: &Path) -> Result<Self> {
         if !model_path.is_file() {
             return Err(anyhow!(
-                "missing VAD model at {}. Run scripts/download-asr.sh",
+                "missing VAD model at {}. Run konnnyaku setup",
                 model_path.display()
             ));
         }

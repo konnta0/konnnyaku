@@ -71,7 +71,7 @@ fn find_role(dir: &Path, role: &str) -> Result<PathBuf> {
     }
     found.ok_or_else(|| {
         anyhow!(
-            "missing {role} onnx in {}. Run scripts/download-asr.sh",
+            "missing {role} onnx in {}. Run konnnyaku setup",
             dir.display()
         )
     })

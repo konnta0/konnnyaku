@@ -6,6 +6,7 @@ target
 # Downloaded / exported models (too large for git)
 models/
 meetings/
+dist/
 *.onnx
 *.tar.bz2
 *.bin

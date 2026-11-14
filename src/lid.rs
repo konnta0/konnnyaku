@@ -101,7 +101,7 @@ fn find_onnx(dir: &Path, role: &str) -> Result<std::path::PathBuf> {
     }
     int8.or(full).ok_or_else(|| {
         anyhow!(
-            "missing {role} onnx in {}. Run scripts/download-asr.sh",
+            "missing {role} onnx in {}. Run konnnyaku setup",
             dir.display()
         )
     })
