@@ -13,18 +13,40 @@ Fully local English speech → Japanese subtitle PoC for Apple Silicon.
 
 ## Install (macOS, Apple Silicon)
 
+Needs a release tarball on GitHub Releases (and, for Homebrew, a formula in [konnta0/homebrew-tap](https://github.com/konnta0/homebrew-tap)). Until the first `v*` release exists, use the development setup below instead.
+
+### Homebrew
+
 ```bash
 brew install konnta0/tap/konnnyaku
-konnnyaku setup                        # once; downloads about 2.5 GB of models
-konnnyaku live --app "Google Chrome"   # caption window
-konnnyaku captions                     # translated lines as JSON
+konnnyaku setup
 ```
 
-Without Homebrew, download `konnnyaku-vX.Y.Z-aarch64-apple-darwin.tar.gz` from the GitHub release, check it against the `.sha256` file, and put `konnnyaku` on your `PATH`. Nothing else has to be installed: `setup` uses the system `curl` and `tar`, and checks every model file against a pinned SHA-256 before using it.
+### Manual
 
-Models and captions live in `~/Library/Application Support/konnnyaku`. Set `KONNNYAKU_HOME` to use another directory. In a source checkout that already has `models/asr/zipformer-en`, the working directory is used instead, as before.
+1. Download `konnnyaku-vX.Y.Z-aarch64-apple-darwin.tar.gz` and its `.sha256` from the [GitHub release](https://github.com/konnta0/konnnyaku/releases).
+2. Check the archive: `shasum -a 256 -c konnnyaku-vX.Y.Z-aarch64-apple-darwin.tar.gz.sha256`
+3. Unpack and put `konnnyaku` on your `PATH`.
+4. Run `konnnyaku setup` once (about 2.5 GB of models).
 
-System Audio Recording permission (System Settings → Privacy & Security) is granted to the terminal app you start `konnnyaku` from, not to `konnnyaku` itself.
+Nothing else has to be installed. `setup` uses the system `curl` and `tar`, and only keeps files that match a pinned SHA-256.
+
+### After install
+
+```bash
+konnnyaku live --mic                          # microphone
+konnnyaku live --app "Google Chrome"          # one app's playback (all tabs)
+konnnyaku live --loopback                     # default system output
+konnnyaku live --mic --app "Google Chrome"    # both
+konnnyaku apps                                # apps that currently have audio
+konnnyaku captions                            # translated lines as JSON
+```
+
+With no capture flags, `live` starts the microphone only. `--app` or `--loopback` starts playback capture and turns the microphone off unless you also pass `--mic`. While the window is open, the header **入力** / **出力** buttons toggle microphone and playback without restarting. There is no separate config file.
+
+Models and captions live in `~/Library/Application Support/konnnyaku`. Set `KONNNYAKU_HOME` to use another directory. In a source checkout that already has `models/asr/zipformer-en`, the working directory is used instead.
+
+System Audio Recording permission (System Settings → Privacy & Security) is granted to the terminal app you start `konnnyaku` from, not to `konnnyaku` itself. If playback is audible but captions stay silent, grant that permission and start audio in the target app before `--app`.
 
 ### For AI agents
 
@@ -110,9 +132,9 @@ cargo run --release -- summary --json
 
 Endpoint trailing silence defaults to 0.8 s (`--rule2`). Lower it for faster subtitles, raise it to avoid cutting mid-sentence.
 
-Live finals are VAD-gated, then rescored, then translated. The default rescorer is Whisper tiny.en. `--whisper-dir` also accepts Whisper distil-small.en or Parakeet TDT 0.6B (`models/asr/parakeet-en`); on the bundled clip they heard the same sentence and did not fix FuguMT. `--no-vad` and `--no-whisper` fall back toward the Zipformer-only path. Songs and heavy BGM still confuse ASR; those finals are skipped instead of emitting `ははは…` / `<unk>`.
+Live finals are VAD-gated, then recognised, then translated when needed. The default English recognizer is Parakeet TDT 0.6B (`--whisper-dir`); `--no-vad` and `--no-whisper` fall back toward the Zipformer-only path. Songs and heavy BGM still confuse ASR; those finals are skipped instead of emitting `ははは…` / `<unk>`.
 
-`live` on macOS opens one transcription window. The header chooses the spoken language and the caption language. The default is English to Japanese, with English on the left and Japanese on the right, without a line between sentences. The same language uses one column and does not translate. Japanese speech uses the Haas ONNX model in `models/asr/haas-ja` (downloaded by `scripts/download-asr.sh`); it rewrites the open line about once a second, then settles at the end of the utterance. Japanese to English shows the Japanese transcript only, because this build has no Japanese-to-English model. English still updates in place while Zipformer is guessing, and the finished Whisper line replaces that sentence. Lines stay until クリア or the window closes. If you have scrolled up, new text does not pull you back to the bottom. `summary` has no window. It records speech in the terminal and writes `meetings/latest.json` as lines arrive. `--json` prints that note on stdout as well. Each item keeps both `english` and `japanese`. Another process can read the file. Decisions and actions are lines that say so (`we decided`, `we need to`, `let's`). This is not a separate abstractive model. Japanese speech summarized without translation is not in this build.
+`live` on macOS opens one transcription window. The header **表示** chooses Japanese or English. Speech in that language is shown as-is; other speech is translated into it (Marian en↔ja). Japanese speech uses Haas ONNX. Lines stay until クリア or the window closes. If you have scrolled up, new text does not pull you back to the bottom. `summary` stays in the terminal and writes `meetings/latest.json`. `--json` also prints that note on stdout. Decisions and actions are keyword-classified lines (`we decided`, `we need to`, `let's`), not a separate abstractive model.
 
 `--app` and `--loopback` are macOS-only. `--app` records that application (including helpers/renderers and every tab). `--loopback` records every application on the default output. Keep Built-in Speakers as the output device for `--loopback`: USB interfaces and headsets that also have a microphone are rejected, because cpal would open their physical input instead of a tap.
 
